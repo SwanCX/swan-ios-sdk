@@ -14,7 +14,7 @@
 
 Pod::Spec.new do |s|
   s.name             = 'SwanSDK'
-  s.version          = '1.3.1'
+  s.version          = '1.3.2'
   s.summary          = 'Swan customer-engagement SDK for iOS'
   s.description      = <<-DESC
     The Swan iOS SDK is the client-side foundation of the Swan customer-engagement
@@ -28,7 +28,7 @@ Pod::Spec.new do |s|
   s.author           = { 'Swan' => 'support@swan.cx' }
   s.source           = {
     :git => 'https://github.com/SwanCX/swan-ios-sdk.git',
-    :tag => "ios/v#{s.version}"
+    :tag => s.version.to_s
   }
 
   s.ios.deployment_target = '13.0'
