@@ -1,12 +1,20 @@
 # Swan iOS SDK — Changelog
 
-## [ios/1.3.2] — 2026-05-18
+## [ios/1.4.0] — 2026-05-19
 
-**Distribution:** Swift Package Manager and CocoaPods (`pod 'SwanSDK', '~> 1.3'`)
+**Distribution:** Swift Package Manager and CocoaPods (`pod 'SwanSDK', '~> 1.4'`)
 **Deployment target:** iOS 13.0+ · Swift 5.9+ · Xcode 15+
 
-### Fixed
+### Added
 
-- **Swift Package Manager resolution.** Installing via SPM with `.package(url: "https://github.com/SwanCX/swan-ios-sdk", from: "1.3.2")` (or pinning by version range in Xcode → File → Add Packages…) now resolves a concrete version. The 1.3.0 and 1.3.1 mirrors used a non-SemVer tag scheme that SPM could not interpret as a version. From 1.3.2 forward, the distribution repo uses plain SemVer tags (`1.3.2`, …). CocoaPods installs (`pod 'SwanSDK', '~> 1.3'`) were unaffected by this issue and continue to work — this release only changes how SPM discovers versions.
+- **Expanded Objective-C surface on `SwanObjC`.** Mixed-language host apps can now drive most of the customer-facing SDK from Obj-C call sites without writing a Swift bridging file. The previous facade covered initialization, identity basics, custom event tracking, super-properties, and APNs token registration — about a fifth of the public surface. The new entries close the gap:
+  - **Async via completion handlers** (Obj-C cannot call Swift `async` directly): `loginWithCompletion`, `requestNotificationPermissionWithCompletion`, `hasNotificationPermissionWithCompletion`, `isPushEnabledWithCompletion`. Each completes on the main thread.
+  - **Device + session state:** `getDeviceInfo` (returns an `NSDictionary` mirror of `SwanDeviceInfo`, with nested location dictionary if a location has been supplied), `getCurrentSessionId`, `getQueueSize`.
+  - **Location:** `updateLocation:longitude:accuracy:` (negative `accuracy` to omit), `isLocationEnabled`.
+  - **Push handling:** `handleDeepLink:`, `handleNotificationUserInfo:` (and a `messageId:` overload), `handleNotificationTap:` (same), `handlePushNotificationUserInfo:`, `unsubscribePush`, `ackPushDelivered:`, `ackPushClicked:type:linkId:`, `flushPendingAcks`.
+  - **Notification categories + badge:** `createNotificationChannelWithId:name:importance:soundName:`, `deleteNotificationChannelWithId:`, `getNotificationChannelId`, `getBadgeCount`, `setBadgeCount:`.
+  - **Lifecycle:** `addInitializedListener:`.
+
+  Listeners that emit typed Swift-struct payloads (`addNotificationOpenedListener`, `addDeepLinkOpenedListener`, the telemetry-event listeners) remain Swift-only — host apps that need them write a small Swift bridging file to adapt the payload into NSObjects. The expanded `Objective-C host apps` section of the [iOS getting-started guide](/docs/getting-started/ios#objective-c-host-apps) shows the full new surface.
 
 ---

@@ -14,7 +14,7 @@
 
 Pod::Spec.new do |s|
   s.name             = 'SwanSDK'
-  s.version          = '1.3.2'
+  s.version          = '1.4.0'
   s.summary          = 'Swan customer-engagement SDK for iOS'
   s.description      = <<-DESC
     The Swan iOS SDK is the client-side foundation of the Swan customer-engagement
