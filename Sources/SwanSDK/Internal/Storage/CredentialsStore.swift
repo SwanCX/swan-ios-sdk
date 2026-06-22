@@ -141,6 +141,16 @@ final class CredentialsStore {
         store.clear()
     }
 
+    /// Conformance-only (SWA-7579): clear the credentials AND force the removal
+    /// out to durable storage synchronously, so a fresh-install runner that
+    /// terminates the process immediately after this returns cannot read a
+    /// stale cfprefsd-cached copy on the cold relaunch. Production code uses
+    /// ``clear()`` — it never needs the synchronous flush.
+    func clearAndSynchronize() {
+        store.clear()
+        store.synchronize()
+    }
+
     enum Keys {
         // The suite-name itself (the UserDefaults suite) carries the
         // RN parity key "swanCredentials"; these are per-field
@@ -182,7 +192,16 @@ final class CredentialsStore {
     /// Idempotent: if the App Group suite already has credentials,
     /// this is a no-op. If the per-process suite has none, this is a
     /// no-op. Otherwise it copies and clears the per-process suite.
-    static func migrateIfNeeded(appGroup: String?) {
+    ///
+    /// `fromSuite` is the per-process source suite to migrate FROM. It
+    /// defaults to the production ``suiteName`` constant — the production
+    /// caller (`Swan.initialize`) passes nothing and so is unchanged. It is
+    /// parameterized only so unit tests can point each test method at its own
+    /// uniquely-named source suite, which is required for cross-test isolation:
+    /// the source suite plist is a single shared on-disk container, so tests
+    /// that all migrated FROM the one hardcoded constant collided when run
+    /// concurrently (SWA-7569).
+    static func migrateIfNeeded(appGroup: String?, fromSuite: String = suiteName) {
         guard let appGroup = appGroup, !appGroup.isEmpty else { return }
         let appGroupStore = CredentialsStore(
             store: UserDefaultsKeyValueStore(suiteName: appGroup)
@@ -191,7 +210,7 @@ final class CredentialsStore {
             return
         }
         let perProcessStore = CredentialsStore(
-            store: UserDefaultsKeyValueStore(suiteName: suiteName)
+            store: UserDefaultsKeyValueStore(suiteName: fromSuite)
         )
         guard let existing = perProcessStore.read() else { return }
         appGroupStore.save(existing)

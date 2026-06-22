@@ -751,6 +751,116 @@ public final class Swan: @unchecked Sendable {
         return lock.sync { internals?.tracker.queueSize() ?? 0 }
     }
 
+    // MARK: - Conformance-only queue introspection (SWA-7578)
+
+    /// One queue row as surfaced to the conformance bridge: the wire event
+    /// name, the persisted lifecycle status, and the retry counter. Mirrors
+    /// the RN runner's `_listQueue` row shape (`{ name, status, retryCount }`)
+    /// so both runners assert against an identical structure.
+    ///
+    /// This is conformance-only (`@_spi(SwanConformance)`): a plain
+    /// `import SwanSDK` never sees it, so it is not part of the customer API
+    /// surface — same gating as ``SwanConformanceHooks``.
+    @_spi(SwanConformance)
+    public struct ConformanceQueueRow: Sendable {
+        public let name: String
+        public let status: String
+        public let retryCount: Int
+    }
+
+    /// Snapshot of EVERY persisted queue row regardless of status
+    /// (`pending`/`sending`/`failed`/`pre_reg`), in insertion order.
+    ///
+    /// Unlike ``getQueueSize()`` — which counts ONLY `pending` rows and so
+    /// reads 0 the instant a flush flips rows to `sending` — this exposes the
+    /// raw row set so the conformance runner can assert "events persisted +
+    /// not sent" deterministically (a row stuck in `sending` because a failed
+    /// flush never deleted it is still visible). It is the iOS analog of the
+    /// RN `_listQueue` bridge.
+    ///
+    /// Returns an empty array if the SDK hasn't been initialized.
+    @_spi(SwanConformance)
+    public func conformanceListQueue() -> [ConformanceQueueRow] {
+        let tracker = lock.sync { internals?.tracker }
+        guard let tracker else { return [] }
+        return tracker.snapshotAllRows().map { row in
+            ConformanceQueueRow(
+                name: row.eventName,
+                status: row.status.wire,
+                retryCount: row.retryCount
+            )
+        }
+    }
+
+    /// Conformance-only: wipe the persisted device credentials so the NEXT
+    /// process launch is a genuine fresh install — no cached `deviceId` /
+    /// `generatedCDID`, so ``DeviceRegistrationService/registerDevice()`` takes
+    /// the network path and issues a real `/v2/device/register` POST.
+    ///
+    /// ## Why a bridge method, not `simctl uninstall`
+    ///
+    /// The SDK persists credentials in the App Group ``UserDefaults`` suite
+    /// (``SwanConfig/appGroup``) so the Notification Service Extension can read
+    /// them cross-process. That suite lives OUTSIDE the app's data container, so
+    /// `simctl uninstall` does NOT remove it, and a stale `cfprefsd`-cached copy
+    /// survives a file-level plist delete too — every "fresh" relaunch then
+    /// short-circuits registration from cache and the fresh-register /
+    /// first-launch assertions become unobservable (the SWA-7579 gap).
+    ///
+    /// Clearing the suite IN-PROCESS goes through `cfprefsd` correctly (the
+    /// running app owns the suite), so after this call + a relaunch the SDK sees
+    /// no credentials and re-registers. This is the iOS analog of the Android
+    /// runner deleting `shared_prefs/swan_credentials.xml` while force-stopped.
+    ///
+    /// Conformance-only (`@_spi(SwanConformance)`): a plain `import SwanSDK`
+    /// never sees it, and it is only ever called from the sample app's
+    /// `#if SWAN_CONFORMANCE` bridge — never from production code.
+    @_spi(SwanConformance)
+    public func conformanceWipeCredentials() {
+        // Reads `internals.store` (the App Group-backed CredentialsStore) under
+        // the same lock every other internals access uses. `clearAndSynchronize()`
+        // removes the Swan-owned keys (deviceId / generatedCDID / appId / …) from
+        // the suite AND forces the removal out to the suite plist synchronously —
+        // the runner terminates the app almost immediately after observing this
+        // call's ack, so the wipe MUST be flushed to disk before the process dies,
+        // or the cold relaunch could read a stale cfprefsd-cached copy and
+        // short-circuit registration (defeating the fresh-install assertion).
+        // After this returns the next `store.read()` is guaranteed nil → genuine
+        // fresh register on relaunch.
+        let store = lock.sync { internals?.store }
+        store?.clearAndSynchronize()
+    }
+
+    /// Conformance-only: wipe EVERY persisted event-queue row AND cancel any
+    /// scheduled retry timer (the periodic-flush task keeps running).
+    ///
+    /// The conformance offline `Given` runs a "severance probe" — it enqueues
+    /// a sentinel event and flushes while offline to PROVE the transport is
+    /// actually severed (the resulting `/v2/trackEvent` must fail with
+    /// `status=0`). That failed flush both leaves the sentinel in the durable
+    /// queue and arms the SDK's single shared retry timer. If left in place,
+    /// the timer would later flush the scenario's REAL offline events together
+    /// with the sentinel, bumping each row's retryCount on every offline
+    /// failure until they hit `maxRetries` and go terminal `failed` — failing
+    /// the "the offline queue still holds the enqueued events" assertion on a
+    /// slow simulator even though the SDK behaved correctly.
+    ///
+    /// Calling this right after the probe confirms severance returns the queue
+    /// to a clean slate: the sentinel is gone and no retry is armed, so the
+    /// real events stage from retryCount 0 with nothing that can mutate them
+    /// before the assertion. The probe stays non-polluting while its severance
+    /// guarantee remains real.
+    ///
+    /// Conformance-only (`@_spi(SwanConformance)`): a plain `import SwanSDK`
+    /// never sees it, and it is only called from the sample app's
+    /// `#if SWAN_CONFORMANCE` bridge — never from production code. Mirrors the
+    /// RN runner's `_clearQueue` bridge.
+    @_spi(SwanConformance)
+    public func conformanceClearQueue() async throws {
+        let tracker = lock.sync { internals?.tracker }
+        try await tracker?.conformanceClearQueueAndRetries()
+    }
+
     /// Set the country super-property. Auto-enriched onto every subsequent
     /// event's `data.country`. Empty string means "not set" — the field is
     /// OMITTED from the wire payload entirely (RN bug #2 fix; see
@@ -988,12 +1098,10 @@ public final class Swan: @unchecked Sendable {
     ///
     /// Note on queue ordering: this iOS surface delegates to the same
     /// `IdentifyService` flow as ``identify(identifier:attributes:)``,
-    /// which already serializes through an async mutex. Pre-flush of
-    /// the event queue is implicit on the server side via the
-    /// `flushPendingEvents` closure injected into ``LogoutService``
-    /// (and on a future iOS-A iteration we can extend this surface
-    /// to call ``flush()`` ahead of the identify too, matching the
-    /// Android `login` posture verbatim).
+    /// which serializes through an async mutex AND flushes the pending
+    /// event + enrich queues BEFORE the CDID swap (SWA-7372), so pre-login
+    /// events are stamped with the pre-swap CDID — matching RN's `login()`
+    /// and Android's `IdentifyService` posture.
     @discardableResult
     public func login(
         identifier: String,
@@ -1006,7 +1114,14 @@ public final class Swan: @unchecked Sendable {
             return LoginResult(cdid: nil, profileSwitched: false)
         }
         let profileData = attributes.isEmpty ? nil : attributes
-        let result = await service.identify(identifier: identifier, profileData: profileData)
+        // login() OMITS skipEmission on the wire so the backend runs the FULL
+        // pipeline (Kafka/RMQ/cart/journey side-effects). Only identify() sets it.
+        // RN parity: login() → sendEventDirectly(USER_LOGIN, data) (no opts).
+        let result = await service.identify(
+            identifier: identifier,
+            profileData: profileData,
+            skipEmission: false
+        )
         switch result {
         case let .success(identify):
             return LoginResult(cdid: identify.CDID, profileSwitched: identify.profileSwitched)
@@ -1103,10 +1218,16 @@ public final class Swan: @unchecked Sendable {
     ///   actual HTTP roundtrip happens on the next flush — no callback,
     ///   no surfaced server response (RN documented this as a v2 BREAKING
     ///   CHANGE).
-    /// - **CDID resolved at flush time.** A host app that calls
-    ///   `enrichProfile()` before login, then logs in before the flush
-    ///   fires, sees the POST-LOGIN CDID on the wire — RN parity
-    ///   (src/index.tsx:1792).
+    /// - **CDID stamped from the identity in effect when the queue
+    ///   drains.** A host app that calls `enrichProfile()` while
+    ///   anonymous, then calls `login()`/`identify()` before any flush
+    ///   fires, sees the PRE-login (anonymous) CDID on the wire — NOT the
+    ///   post-login one. `login()`/`identify()` drain the pending event +
+    ///   enrich queues BEFORE swapping the CDID (the flush-before-swap
+    ///   invariant, SWA-7372), so an enrichment queued under the anonymous
+    ///   identity is sent under that same identity. RN behaves the same:
+    ///   its `login()` flushes the queue before switching profiles
+    ///   (src/index.tsx:2734).
     /// - **Per-event POST.** Each queued blob becomes one HTTP request —
     ///   NOT a batch. Failures re-queue the event at the FRONT for retry
     ///   on the next flush.
@@ -1754,6 +1875,13 @@ public final class Swan: @unchecked Sendable {
                 credentialsStore: store,
                 sessionManager: sessionManager,
                 configProvider: { [weak tracker] in tracker?.currentConfig() ?? EventConfig() },
+                flushPendingEvents: { [weak tracker, weak enrichService] in
+                    // SWA-7372 flush-before-swap: drain BOTH queues before the
+                    // identify/login CDID swap so pre-login events keep the
+                    // pre-swap CDID. Same seam LogoutService uses.
+                    _ = await tracker?.flush()
+                    await enrichService?.flush()
+                },
                 identifierChangedListener: { [weak telemetryEmitter] cdid in
                     telemetryEmitter?.emit(SwanIdentifierChangedPayload(
                         swanIdentifier: cdid, source: .identify
@@ -1971,6 +2099,11 @@ public final class Swan: @unchecked Sendable {
                 credentialsStore: store,
                 sessionManager: sessionManager,
                 configProvider: { [weak tracker] in tracker?.currentConfig() ?? EventConfig() },
+                flushPendingEvents: { [weak tracker, weak enrichService] in
+                    // SWA-7372 flush-before-swap (test wiring mirrors prod).
+                    _ = await tracker?.flush()
+                    await enrichService?.flush()
+                },
                 identifierChangedListener: { [weak telemetryEmitter] cdid in
                     telemetryEmitter?.emit(SwanIdentifierChangedPayload(
                         swanIdentifier: cdid, source: .identify

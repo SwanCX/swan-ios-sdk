@@ -133,25 +133,43 @@ internal final class LogoutService: @unchecked Sendable {
             await flushPendingEvents()
 
             // Best-effort server notification. Any error is logged and we
-            // proceed with the local clear — RN parity contract.
+            // proceed with the local clear — RN parity contract. The response
+            // MAY carry a freshly-minted anonymous CDID we adopt below.
+            var logoutResponse: EventBatchResponse?
             do {
-                _ = try await postLogout(creds: creds)
+                logoutResponse = try await postLogout(creds: creds)
             } catch {
                 SwanLogger.warn(
                     "Swan.logout: server request failed — user is logged out locally: \(error.localizedDescription)"
                 )
             }
 
-            // Clear currentCDID + identifier. generatedCDID + deviceId stay
-            // so the SDK reverts to anonymous-identity state (Phase 1.0).
-            // PRESERVE pushNotificationToken + ackUrl — logout doesn't
-            // revoke the push subscription (that's `unsubscribePush()`)
-            // and the cold-start sender still needs `ackUrl`.
+            // SWA-7372 / SWA-7343: adopt a rotated anonymous CDID when the
+            // backend returned one. When a FIRST-TIME anonymous user logged in,
+            // the backend promoted this device's generatedCDID IN PLACE into the
+            // identified customer — so reverting to it would land the device back
+            // on the now-identified profile. Only the backend knows whether that
+            // happened, so it returns a fresh anonymous CDID on the userLogout
+            // response. Adopt it as the new generatedCDID. Absent / empty →
+            // keep the existing one (backward compatible; older backends and the
+            // profile-SWITCH case are unaffected). See
+            // spec/behavior/identity-merge.yaml `logout_response_contract`.
+            let anonymousCDID = Self.resolveAnonymousCDID(
+                current: creds.generatedCDID,
+                response: logoutResponse
+            )
+
+            // Clear currentCDID + identifier. generatedCDID is the (possibly
+            // rotated) anonymous identifier; deviceId stays so the SDK reverts
+            // to anonymous-identity state (Phase 1.0). PRESERVE
+            // pushNotificationToken + ackUrl — logout doesn't revoke the push
+            // subscription (that's `unsubscribePush()`) and the cold-start
+            // sender still needs `ackUrl`.
             credentialsStore.save(
                 SwanCredentials(
                     appId: creds.appId,
                     deviceId: creds.deviceId,
-                    generatedCDID: creds.generatedCDID,
+                    generatedCDID: anonymousCDID,
                     currentCDID: nil,
                     identifier: nil,
                     pushNotificationToken: creds.pushNotificationToken,
@@ -160,15 +178,15 @@ internal final class LogoutService: @unchecked Sendable {
             )
 
             SwanLogger.debug(
-                "Swan.logout: user logged out locally; reverted to anonymous CDID \(creds.generatedCDID)."
+                "Swan.logout: user logged out locally; reverted to anonymous CDID \(anonymousCDID)."
             )
 
             // Mirrors RN's `emit('swanIdentifierChanged', await getSwanIdentifier())`
             // at src/index.tsx:2824. Listeners receive the new (anonymous)
-            // identifier.
-            identifierChangedListener?(creds.generatedCDID)
+            // identifier — the rotated one when the backend rotated it.
+            identifierChangedListener?(anonymousCDID)
 
-            return .success(LogoutResult(CDID: creds.generatedCDID))
+            return .success(LogoutResult(CDID: anonymousCDID))
         }
     }
 
@@ -264,6 +282,34 @@ internal final class LogoutService: @unchecked Sendable {
     }
 
     // MARK: - Static helpers
+
+    /// Resolve the post-logout anonymous CDID, adopting a rotated one from the
+    /// userLogout response when present.
+    ///
+    /// The fresh anonymous CDID MAY arrive under `generatedCDID` (canonical,
+    /// matching the `/v2/device/register` response field) or `newAnonymousCDID`
+    /// (accepted alias). Absent / empty → keep `current`. Mirrors RN's
+    /// `resolveAnonymousCDIDAfterLogout` (src/utils/logoutIdentity.ts) and the
+    /// `spec/behavior/identity-merge.yaml` `logout_response_contract`.
+    /// Visible for testing.
+    internal static func resolveAnonymousCDID(
+        current: String,
+        response: EventBatchResponse?
+    ) -> String {
+        // Prefer the canonical `generatedCDID`, but fall through to the alias
+        // when canonical is absent OR present-but-empty. A plain `??` would
+        // stop at a non-nil empty string (`Optional.some("")`) and never try
+        // the alias — silently dropping a valid `newAnonymousCDID` if a backend
+        // sent `{generatedCDID:"", newAnonymousCDID:"…"}`. Each candidate is
+        // accepted only when non-empty; otherwise keep `current` (backward
+        // compatible). First non-empty wins.
+        for candidate in [response?.generatedCDID, response?.newAnonymousCDID] {
+            if let value = candidate, !value.isEmpty {
+                return value
+            }
+        }
+        return current
+    }
 
     static let pathTrackEvent = "/v2/trackEvent"
 

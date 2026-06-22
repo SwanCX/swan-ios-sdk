@@ -39,9 +39,11 @@ internal struct IdentifyResult: Equatable {
 ///   is already present, no-op (no network call) — matches RN's fast-path
 ///   (src/index.tsx:2585).
 /// - **Network**: synchronous single-event POST to `/v2/trackEvent`,
-///   `isBatch:false`, one `userLogin` event with `skipEmission:true`.
-///   Backend gates Kafka/RMQ/cart/journey side-effects on the flag — only
-///   the profile-switching path runs (eventProcessing.ts:90).
+///   `isBatch:false`, one `userLogin` event. `identify()` adds
+///   `skipEmission:true` so the backend runs ONLY the profile-switching path
+///   and gates Kafka/RMQ/cart/journey side-effects on the flag
+///   (eventProcessing.ts:90). `login()` OMITS the flag so the backend runs the
+///   FULL pipeline (RN parity).
 /// - **Best-effort**: on any network/protocol failure or unsuccessful
 ///   response the SDK identity is UNCHANGED. Resolves with the current CDID
 ///   + `profileSwitched=false`. RN parity (src/index.tsx:2637).
@@ -81,6 +83,15 @@ internal final class IdentifyService: @unchecked Sendable {
     private let credentialsStore: CredentialsStore
     private let sessionManager: SessionManager
     private let configProvider: @Sendable () -> EventConfig
+    /// Flush pending queued events before the identify/login HTTP call (and the
+    /// CDID swap it may trigger). Injected as a seam so this service doesn't
+    /// need a direct dependency on [EventTracker] — the [Swan] facade wires it
+    /// to `tracker.flush()` + `enrichService.flush()`, exactly as it does for
+    /// [LogoutService]. Returns when the flush completes; failures are NOT
+    /// propagated (best-effort parity). See spec/behavior/identity-merge.yaml
+    /// `queue_flush_invariant` — pre-login events must be stamped with the
+    /// PRE-swap CDID, so the flush MUST precede the swap (SWA-7372).
+    private let flushPendingEvents: @Sendable () async -> Void
     private let deviceInfoProvider: @Sendable () -> EventEnrichment.DeviceInfo
     private let clock: @Sendable () -> Date
     private let idGenerator: @Sendable () -> String
@@ -101,6 +112,7 @@ internal final class IdentifyService: @unchecked Sendable {
         credentialsStore: CredentialsStore,
         sessionManager: SessionManager,
         configProvider: @escaping @Sendable () -> EventConfig,
+        flushPendingEvents: @escaping @Sendable () async -> Void = {},
         deviceInfoProvider: @escaping @Sendable () -> EventEnrichment.DeviceInfo = { .current() },
         clock: @escaping @Sendable () -> Date = { Date() },
         idGenerator: @escaping @Sendable () -> String = { UUID().uuidString },
@@ -113,6 +125,7 @@ internal final class IdentifyService: @unchecked Sendable {
         self.credentialsStore = credentialsStore
         self.sessionManager = sessionManager
         self.configProvider = configProvider
+        self.flushPendingEvents = flushPendingEvents
         self.deviceInfoProvider = deviceInfoProvider
         self.clock = clock
         self.idGenerator = idGenerator
@@ -130,12 +143,20 @@ internal final class IdentifyService: @unchecked Sendable {
     ///   - profileData: optional `profileData` blob passed to the backend
     ///     in the userLogin event payload. Backend strips it from the event
     ///     before forwarding downstream (eventProcessing.ts:140).
+    ///   - skipEmission: when `true` (the `identify()` path) the wire event
+    ///     carries `skipEmission:true` so the backend runs ONLY the
+    ///     profile-switch and skips Kafka/RMQ/cart/journey side-effects. When
+    ///     `false` (the `login()` path) the key is OMITTED entirely so the
+    ///     backend runs the FULL pipeline. RN parity: identify() →
+    ///     `sendEventDirectly(USER_LOGIN, data, {skipEmission:true})`;
+    ///     login() → `sendEventDirectly(USER_LOGIN, data)` (field absent).
     /// - Returns: `.success(IdentifyResult)` on a successful (best-effort)
     ///   call; `.failure(IdentifyError)` only for validation / pre-reg
     ///   programmer errors.
     func identify(
         identifier: String,
-        profileData: [String: JSONValue]? = nil
+        profileData: [String: JSONValue]? = nil,
+        skipEmission: Bool = true
     ) async -> Result<IdentifyResult, Error> {
         guard !identifier.isEmpty else {
             return .failure(IdentifyError.emptyIdentifier)
@@ -147,7 +168,9 @@ internal final class IdentifyService: @unchecked Sendable {
             }
 
             // Idempotent fast-path: same identifier + a CDID already present
-            // → no network call. Matches RN src/index.tsx:2585.
+            // → no network call. Matches RN src/index.tsx:2585. No swap is
+            // happening here, so no flush is needed (and we must NOT flush
+            // queued events under a different identity than they were tracked).
             if let currentCDID = creds.currentCDID,
                creds.identifier == identifier {
                 SwanLogger.debug(
@@ -156,6 +179,16 @@ internal final class IdentifyService: @unchecked Sendable {
                 return .success(IdentifyResult(CDID: currentCDID, profileSwitched: false))
             }
 
+            // CRITICAL invariant (SWA-7372) — flush BEFORE the CDID swap, just
+            // like ``LogoutService/logout()``. identify()/login() may swap the
+            // CDID on a profileSwitched response; any events tracked while
+            // anonymous must reach the backend stamped with the PRE-swap CDID,
+            // not the post-login one. RN's login() / Android's IdentifyService
+            // both flush here; the iOS port previously deferred this ("future
+            // iOS-A"). See spec/behavior/identity-merge.yaml
+            // `queue_flush_invariant`. Failures are swallowed (best-effort).
+            await flushPendingEvents()
+
             // Best-effort network call. Any failure → return success with
             // unchanged CDID, do NOT propagate. RN src/index.tsx:2637.
             let response: EventBatchResponse?
@@ -163,7 +196,8 @@ internal final class IdentifyService: @unchecked Sendable {
                 response = try await postIdentify(
                     creds: creds,
                     identifier: identifier,
-                    profileData: profileData
+                    profileData: profileData,
+                    skipEmission: skipEmission
                 )
             } catch {
                 SwanLogger.warn(
@@ -233,7 +267,8 @@ internal final class IdentifyService: @unchecked Sendable {
     private func postIdentify(
         creds: SwanCredentials,
         identifier: String,
-        profileData: [String: JSONValue]?
+        profileData: [String: JSONValue]?,
+        skipEmission: Bool
     ) async throws -> EventBatchResponse? {
         let cfg = configProvider()
         let info = deviceInfoProvider()
@@ -253,7 +288,8 @@ internal final class IdentifyService: @unchecked Sendable {
             timeOfLogin: timeOfLogin,
             sessionId: sessionId,
             config: cfg,
-            deviceInfo: info
+            deviceInfo: info,
+            skipEmission: skipEmission
         )
 
         let bodyData = try Self.jsonEncoder.encode(payload)
@@ -281,9 +317,15 @@ internal final class IdentifyService: @unchecked Sendable {
     /// Build the identify wire payload.
     ///
     /// Field order matches `spec/wire/golden/event-ingest-identify-skipemission.json`
-    /// (common → events[0] → isBatch). Encoded via [IdentifyPayload]'s
-    /// hand-rolled `encode(to:)` so `currentCDID:null` (not omitted) and
-    /// `profileData:null` (not omitted) reach the wire.
+    /// (identify, skipEmission:true) and
+    /// `spec/wire/golden/event-ingest-login-direct.json` (login, skipEmission
+    /// absent). Encoded via [IdentifyPayload]'s hand-rolled `encode(to:)` so
+    /// `currentCDID:null` (not omitted) and `profileData:null` (not omitted)
+    /// reach the wire.
+    ///
+    /// - Parameter skipEmission: when `true` the event carries
+    ///   `skipEmission:true` (identify()); when `false` the key is OMITTED
+    ///   entirely (login()). NEVER encoded as `false`/`null`.
     internal static func buildIdentifyPayload(
         appId: String,
         sdkVersion: String,
@@ -295,7 +337,8 @@ internal final class IdentifyService: @unchecked Sendable {
         timeOfLogin: String,
         sessionId: String,
         config: EventConfig,
-        deviceInfo: EventEnrichment.DeviceInfo
+        deviceInfo: EventEnrichment.DeviceInfo,
+        skipEmission: Bool = true
     ) -> IdentifyPayload {
         let data = IdentifyEventData(
             timeOfLogin: timeOfLogin,
@@ -319,7 +362,9 @@ internal final class IdentifyService: @unchecked Sendable {
             userId: userId,
             currentCDID: creds.currentCDID,
             generatedCDID: creds.generatedCDID,
-            skipEmission: true
+            // identify() → true (key present); login() → nil (key OMITTED).
+            // NEVER `false` — the field must be absent for login (RN parity).
+            skipEmission: skipEmission ? true : nil
         )
         let common = EventBatchCommon(
             appId: appId,
@@ -380,6 +425,10 @@ internal struct IdentifyPayload: Encodable {
 
 /// One identify event. Same field set as [BatchEvent] PLUS `skipEmission`,
 /// MINUS the free-form `data` (replaced with the fixed ``IdentifyEventData``).
+///
+/// `skipEmission` is OPTIONAL on the wire: `identify()` sets it `true`
+/// (key present), `login()` leaves it `nil` (key OMITTED — the backend then
+/// runs the full pipeline). It is NEVER encoded as `false` or `null`.
 internal struct IdentifyEvent: Encodable {
     let id: String
     let name: String
@@ -388,7 +437,7 @@ internal struct IdentifyEvent: Encodable {
     let userId: String
     let currentCDID: String?
     let generatedCDID: String
-    let skipEmission: Bool
+    let skipEmission: Bool?
 
     enum CodingKeys: String, CodingKey {
         case id, name, timestamp, data, userId, currentCDID, generatedCDID, skipEmission
@@ -409,8 +458,12 @@ internal struct IdentifyEvent: Encodable {
             try c.encodeNil(forKey: .currentCDID)
         }
         try c.encode(generatedCDID, forKey: .generatedCDID)
-        // skipEmission is the whole point of identify — must be `true`.
-        try c.encode(skipEmission, forKey: .skipEmission)
+        // skipEmission: present-and-true ONLY for identify(). For login() it's
+        // nil → the key is OMITTED (NOT encoded as false/null) so the backend
+        // runs the full pipeline. RN parity: src/index.tsx:1608 conditional spread.
+        if let skipEmission = skipEmission {
+            try c.encode(skipEmission, forKey: .skipEmission)
+        }
     }
 }
 

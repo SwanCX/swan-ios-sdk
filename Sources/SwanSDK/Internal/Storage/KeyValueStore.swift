@@ -9,6 +9,18 @@ protocol KeyValueStore: AnyObject {
     func getString(_ key: String) -> String?
     func putString(_ key: String, _ value: String?)
     func clear()
+    /// Force any pending writes to durable storage synchronously.
+    ///
+    /// Production code does NOT need this — `UserDefaults` flushes on its own
+    /// schedule and the SDK never depends on a write being on-disk by a
+    /// specific instant. It exists for the conformance fresh-install seam
+    /// (SWA-7579): the runner wipes credentials IN-PROCESS and then
+    /// `simctl terminate`s the app almost immediately, so the removal MUST be
+    /// flushed to the suite plist before the process dies — otherwise the cold
+    /// relaunch could read a stale cfprefsd-cached copy and short-circuit
+    /// registration, defeating the fresh-install test. No-op for the in-memory
+    /// fake (its writes are already synchronous).
+    func synchronize()
 }
 
 /// UserDefaults-backed production store.
@@ -92,6 +104,16 @@ final class UserDefaultsKeyValueStore: KeyValueStore {
         }
     }
 
+    func synchronize() {
+        // `UserDefaults.synchronize()` is a no-op for ordinary app flow (the
+        // system persists on its own), but for the conformance fresh-install
+        // seam it forces the credential removal out to the suite plist before
+        // the runner terminates the process. Deprecated for general use but
+        // still the only API that guarantees a synchronous flush, which is
+        // exactly what the cross-process / about-to-die case needs.
+        defaults.synchronize()
+    }
+
     /// Allowlist of Swan-owned key NAMES (without the optional `keyPrefix`).
     /// MUST be kept in sync with the actual `Keys` enums across the SDK.
     /// If a new SDK persisted key is introduced and missed here, `clear()`
@@ -147,5 +169,9 @@ final class InMemoryKeyValueStore: KeyValueStore {
     func clear() {
         lock.lock(); defer { lock.unlock() }
         map.removeAll()
+    }
+
+    func synchronize() {
+        // In-memory writes are already durable-by-construction; nothing to flush.
     }
 }

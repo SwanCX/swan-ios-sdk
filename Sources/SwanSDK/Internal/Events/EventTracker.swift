@@ -318,6 +318,106 @@ internal final class EventTracker: @unchecked Sendable {
         return durableQueue
     }
 
+    /// Conformance-only — wipe EVERY persisted queue row AND cancel any
+    /// pending retry timer, WITHOUT stopping the periodic-flush task.
+    ///
+    /// Why both halves matter: a failed offline flush both (a) leaves its
+    /// batch in the durable queue and (b) schedules ``retryTask`` (a single
+    /// shared backoff timer). Clearing only the rows would still leave the
+    /// armed `retryTask` to fire `flushOnce()` against whatever the scenario
+    /// enqueues NEXT — re-pulling those rows into a failing offline batch and
+    /// bumping their retryCount toward `maxRetries`. So the conformance
+    /// severance probe, after it has PROVEN the transport is offline, calls
+    /// this to return the queue to a clean slate with no in-flight retry: the
+    /// scenario's real offline events then start from retryCount 0 with no
+    /// timer that can mutate them before the "still holds" assertion runs.
+    ///
+    /// ## Why this acquires the single-flight slot (the no-escape guarantee)
+    ///
+    /// Simply cancelling `retryTask` is NOT enough: by the time this runs, an
+    /// armed retry's backoff may already have elapsed and the timer entered
+    /// `flushOnce()` — Swift `Task.cancel()` is cooperative and `flushOnce()`
+    /// does not poll `isCancelled`, so that in-flight flush runs to completion,
+    /// and on its offline failure its `catch` calls ``scheduleRetry`` AGAIN,
+    /// re-arming a NEW retry AFTER our cancel — a stale timer that survives the
+    /// wipe and can later mutate the scenario's real events.
+    ///
+    /// To close that, this acquires the SAME `flushInFlight` single-flight slot
+    /// `flushOnce()` uses. The slot is mutually exclusive, so this can only
+    /// proceed once NO flush is running (it waits out an in-flight one — whose
+    /// completion may schedule a retry, which we then cancel), and WHILE it
+    /// holds the slot any timer-fired `flushOnce()` short-circuits to `nil`
+    /// (sees the slot taken) without dequeuing or scheduling. Under that
+    /// protection we cancel the retry, clear the rows, then cancel once more
+    /// (belt for a retry the just-finished flush armed) before releasing. After
+    /// release, any not-yet-fired retry timer that does fire finds an EMPTY
+    /// queue → `dequeueForSend` returns nothing → `flushOnce()` returns early
+    /// WITHOUT calling `scheduleRetry`, so no stale retry can re-arm.
+    ///
+    /// Unlike ``stop()``, this preserves `periodicTask` (the scenario still
+    /// needs periodic + explicit flushes to work after the probe). Mirrors the
+    /// RN runner's `_clearQueue` bridge intent (wipe the table to stage a
+    /// known-empty queue). Conformance-only — reached only from the
+    /// `#if SWAN_CONFORMANCE` bridge, never production code.
+    func conformanceClearQueueAndRetries() async throws {
+        // Acquire the single-flight slot: spin until no flush is running, so
+        // we never clear UNDER a live flushOnce() (which would otherwise
+        // re-arm a retry after our cancel). Bounded so a wedged slot can't
+        // hang the harness.
+        //
+        // CRITICAL: if the slot cannot be acquired within the bound, we do
+        // NOT fall back to an unlocked clear. An unlocked clear could run
+        // while a live flushOnce() is mid-send; that flush would then fail,
+        // run handleBatchFailure for its stale rows, and call scheduleRetry()
+        // AFTER we returned — re-arming a retry that survives the wipe and can
+        // later mutate the scenario's real events (the exact race this method
+        // closes). So on acquisition timeout we THROW instead, surfacing a
+        // clear setup failure to the runner rather than a silently-unsafe
+        // "success". In practice the slot is free within milliseconds (the
+        // probe flush already settled before the runner calls this), so the
+        // bound is a safety net, not the normal path.
+        let acquireDeadline = Date().addingTimeInterval(5.0)
+        var acquired = false
+        while Date() < acquireDeadline {
+            let got: Bool = lock.sync {
+                if flushInFlight { return false }
+                flushInFlight = true
+                return true
+            }
+            if got { acquired = true; break }
+            // Yield briefly so an in-flight flush (and its retry scheduling)
+            // can finish and release the slot.
+            try? await Task.sleep(nanoseconds: 20_000_000) // 20ms
+        }
+        guard acquired else {
+            throw ConformanceClearError.flushSlotUnavailable
+        }
+        // Hold the slot across the whole critical section so no concurrent
+        // flush body can run; release it on every exit path.
+        defer { lock.sync { flushInFlight = false } }
+        // Cancel any armed retry, wipe the queue, then cancel once more to
+        // catch a retry the just-finished in-flight flush may have scheduled
+        // while we were acquiring the slot.
+        lock.sync {
+            retryTask?.cancel()
+            retryTask = nil
+        }
+        durableQueue.clear()
+        lock.sync {
+            retryTask?.cancel()
+            retryTask = nil
+        }
+    }
+
+    /// Failure surfaced by ``conformanceClearQueueAndRetries()`` when it could
+    /// not acquire the flush single-flight slot in time — the clear is then
+    /// NOT performed (an unlocked clear would race a live flush and re-arm a
+    /// retry), so the conformance runner gets a clear error instead of a
+    /// silently-unsafe success.
+    enum ConformanceClearError: Error {
+        case flushSlotUnavailable
+    }
+
     // MARK: - Internals
 
     /// Dequeue a batch, POST to `/v2/trackEvent`, apply state transitions.

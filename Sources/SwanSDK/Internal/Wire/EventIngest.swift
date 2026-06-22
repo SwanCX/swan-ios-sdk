@@ -43,12 +43,52 @@ internal struct EventBatchPayload: Encodable {
     }
 }
 
+/// Capabilities this SDK advertises to the backend on the `common` block of
+/// every tracking request (SWA-7372 / SWA-7343 / SWA-7366).
+///
+/// `/v2/trackEvent` is shared across all SDKs (RN / iOS / Android / Web), so
+/// the backend must NOT infer capability from the (per-platform,
+/// non-comparable) `sdkVersion` — the SDK declares it here. This is the SINGLE
+/// SOURCE OF TRUTH: every payload built with ``EventBatchCommon`` (batch flush,
+/// identify, login, logout) stamps the same list, so the direct-send (logout /
+/// login) and batch paths can never drift apart.
+///
+/// - `anon-cdid-rotation`: this SDK will ADOPT a rotated anonymous CDID
+///   returned by `logout()` (the adopt side lives in
+///   ``LogoutService/logout()``). Only when the backend sees this flag does it
+///   mint + return a fresh anonymous CDID on a conversion-logout; without it
+///   the backend leaves logout behavior unchanged (so it never creates orphan
+///   anonymous profiles for clients that would ignore the value).
+///
+/// Mirrors RN's `SDK_CAPABILITIES` (src/utils/sdkCapabilities.ts).
+internal enum SwanCapabilities {
+    static let all: [String] = ["anon-cdid-rotation"]
+}
+
 internal struct EventBatchCommon: Encodable {
     let appId: String
     let deviceId: String
     let sdkVersion: String
     /// `"ios"` for iOS, `"android"` for Android. Locked.
     let platform: String
+    /// Capabilities the SDK advertises to the backend. Defaults to the SDK's
+    /// full ``SwanCapabilities/all`` list so every construction site stamps the
+    /// same single source of truth — callers never pass this explicitly.
+    let capabilities: [String]
+
+    init(
+        appId: String,
+        deviceId: String,
+        sdkVersion: String,
+        platform: String,
+        capabilities: [String] = SwanCapabilities.all
+    ) {
+        self.appId = appId
+        self.deviceId = deviceId
+        self.sdkVersion = sdkVersion
+        self.platform = platform
+        self.capabilities = capabilities
+    }
 }
 
 /// One event inside a batch.
@@ -132,12 +172,32 @@ internal struct BatchEvent: Codable, Equatable {
 
 /// Response from `POST /v2/trackEvent`.
 ///
-/// Spec: `spec/wire/golden/event-ingest-response.json`.
+/// Spec: `spec/wire/golden/event-ingest-response.json`,
+/// `spec/behavior/identity-merge.yaml` `logout_response_contract`.
+///
+/// ## Transport-seam note (SWA-7372 / SWA-7343)
+///
+/// `generatedCDID` / `newAnonymousCDID` are the FRESH anonymous CDID the
+/// backend mints on a conversion-logout. They are TOP-LEVEL on the userLogout
+/// response (alongside `success`), NOT inside `results[]`. They MUST be decoded
+/// here so ``LogoutService/logout()`` can adopt the rotated CDID.
+///
+/// This is the seam RN regressed on (SWA-7343): a response shaper that
+/// hard-picked only `{ success, CDID, profileSwitched }` silently dropped the
+/// rotation fields, making the adopt logic dead code. Swift `Codable` would do
+/// the same — an unlisted key is simply not decoded — so these fields are
+/// listed explicitly. The fields are optional + backward-compatible: an older
+/// backend that returns neither leaves them `nil` and logout behavior unchanged.
 internal struct EventBatchResponse: Decodable {
     let success: Bool
     let processedCount: Int?
     let failedCount: Int?
     let results: [BatchResult]?
+    /// Fresh anonymous CDID minted by the backend on conversion-logout
+    /// (canonical — same field name as the `/v2/device/register` response).
+    let generatedCDID: String?
+    /// Accepted alias for ``generatedCDID`` on the logout response.
+    let newAnonymousCDID: String?
 }
 
 /// Per-event result inside ``EventBatchResponse``.

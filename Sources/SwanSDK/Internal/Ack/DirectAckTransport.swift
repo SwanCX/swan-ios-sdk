@@ -40,6 +40,21 @@ final class DirectAckTransport {
             let config = URLSessionConfiguration.default
             config.timeoutIntervalForRequest = Self.timeoutSeconds
             config.timeoutIntervalForResource = Self.timeoutSeconds
+            // Conformance-only seam: prepend any runner-supplied `URLProtocol`
+            // subclasses so the conformance harness can capture + stub the
+            // SDK's outbound ACK POST — exactly as `SwanHttpClient` does for
+            // every other endpoint. Without this, the ACK runs on a private
+            // `.default` session that a config-scoped capturing `URLProtocol`
+            // never sees, so the delivery-click-ack round-trip would be
+            // invisible to the iOS `_http` capture (the @simulator-push ACK
+            // lane, SWA-7773). `nil` in every release build (the hook is only
+            // ever set by the sample app under `#if SWAN_CONFORMANCE`), so
+            // production ACK sessions are byte-identical to before. Read once,
+            // here, at construction — see `SwanConformanceHooks`.
+            if let conformanceProtocols = SwanConformanceHooks.currentProtocolClasses(),
+               !conformanceProtocols.isEmpty {
+                config.protocolClasses = conformanceProtocols + (config.protocolClasses ?? [])
+            }
             self.session = URLSession(configuration: config)
         }
     }

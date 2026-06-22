@@ -29,13 +29,22 @@ import FoundationNetworking
 ///   RN throws "Credential not found! Please wait for Swan to register the
 ///   device!" (src/index.tsx:2014). Enrichments are NOT buffered like
 ///   `track()` — they share the identify/logout rejection posture.
-/// - **CDID resolved at FLUSH time, not enqueue time.** RN's enrichPromises
-///   block reads `decodedCredentials.currentCDID || generatedCDID` inside
-///   sendEventBatch (src/index.tsx:1792). Mirroring that here means a host
-///   app that calls `enrichProfile()` before login, then logs in before the
-///   flush fires, will see the post-login CDID on the wire — which matches
-///   RN exactly and is what the conformance scenario "CDID on flushed
-///   enrich body uses currentCDID when logged in" asserts.
+/// - **CDID resolved at FLUSH time, not enqueue time.** `flush()` reads
+///   `currentCDID ?? generatedCDID` from the store when it builds each body
+///   (RN's enrichPromises block reads the same, src/index.tsx:1800-1804), so
+///   the wire CDID reflects whatever identity is in effect at the moment the
+///   queue drains — not the one captured at `enrichProfile()` call time. When
+///   the SDK is already logged in, that's the logged-in `currentCDID`; when
+///   anonymous, the `generatedCDID`. This is what the conformance scenarios
+///   "CDID on flushed enrich body uses currentCDID when logged in" /
+///   "falls back to generatedCDID when anonymous" assert.
+///   NOTE: this service does not, on its own, decide pre- vs post-login
+///   for an enrichment queued just before a `login()`/`identify()`. Those
+///   identity calls drain this queue BEFORE swapping the CDID
+///   (flush-before-swap, SWA-7372 — see `Swan.login`/`IdentifyService`), so
+///   an enrichment queued while anonymous is flushed under the anonymous
+///   CDID, never the post-login one. RN's `login()` flushes the same way
+///   before switching profiles (src/index.tsx:2734).
 /// - **Per-event POST.** Each queued enrichment becomes one HTTP request
 ///   to `/v2/customer/enrich-profile?appId=<appId>` (RN's
 ///   `enrichPromises.map(async event => ...)` — NOT a single batch).
@@ -221,9 +230,10 @@ internal final class EnrichProfileService: @unchecked Sendable {
     ///   - `id` — uuid for logging + future per-event status tracking.
     ///   - `profileData` — caller's blob, frozen as immutable dict.
     ///
-    /// Notably NOT captured: the CDID. RN resolves CDID at flush time
-    /// (src/index.tsx:1792), and the conformance scenario "CDID on flushed
-    /// enrich body uses currentCDID when logged in" requires that behavior.
+    /// Notably NOT captured: the CDID. It is read from the store at flush
+    /// time (src/index.tsx:1800-1804), and the conformance scenario "CDID on
+    /// flushed enrich body uses currentCDID when logged in" requires that
+    /// behavior.
     internal struct PendingEnrichment {
         let id: String
         let profileData: [String: JSONValue]

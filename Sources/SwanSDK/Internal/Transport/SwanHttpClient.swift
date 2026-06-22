@@ -49,6 +49,16 @@ final class SwanHttpClient: HttpTransport {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = timeout
         config.timeoutIntervalForResource = timeout
+        // Conformance-only seam: prepend any runner-supplied `URLProtocol`
+        // subclasses so the conformance harness can capture + stub the
+        // SDK's outbound HTTP. `nil` in every release build (the hook is
+        // only ever set by the sample app under `#if SWAN_CONFORMANCE`),
+        // so production sessions are byte-identical to before. Read once,
+        // here, at construction — see `SwanConformanceHooks`.
+        if let conformanceProtocols = SwanConformanceHooks.currentProtocolClasses(),
+           !conformanceProtocols.isEmpty {
+            config.protocolClasses = conformanceProtocols + (config.protocolClasses ?? [])
+        }
         let session = URLSession(configuration: config)
         self.session = session
         self.deviceIdProvider = deviceIdProvider
