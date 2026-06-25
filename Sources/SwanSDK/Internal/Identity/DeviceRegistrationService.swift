@@ -60,7 +60,11 @@ final class DeviceRegistrationService {
 
         do {
             let response = try await postRegister()
-            guard let deviceId = response.deviceId else {
+            // The endpoint returns the device id at the top level on
+            // `register_device` but only nested under `deviceDoc.deviceId` on
+            // `update_device`. Resolve from whichever form the server sent so a
+            // returning device never persists a nil deviceId.
+            guard let deviceId = response.deviceId ?? response.deviceDoc?.deviceId else {
                 return .failure(HttpError.missingField("deviceId"))
             }
             guard let generatedCDID = response.generatedCDID else {

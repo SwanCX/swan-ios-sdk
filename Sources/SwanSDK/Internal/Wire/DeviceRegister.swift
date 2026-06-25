@@ -75,9 +75,13 @@ struct LocationPayload: Encodable {
 ///
 /// Spec: `spec/wire/golden/device-register-response.json`
 ///
-/// `deviceDoc` kept as a raw `[String: Any]` (decoded via JSONSerialization
-/// at the call site) — it is server-managed and free-form, and we don't
-/// want to bind the SDK to its evolving shape.
+/// The endpoint serves two purposes (`register_device` / `update_device`) and
+/// returns the device id in two places depending on which path ran:
+///   - `register_device` puts it at the top level (`deviceId`).
+///   - `update_device` returns it only nested under `deviceDoc.deviceId`.
+/// Both forms are decoded so the id can be resolved from whichever the server
+/// sent. The remaining server-managed `deviceDoc` fields stay free-form and
+/// are not bound here.
 ///
 /// IMPORTANT: there is NO `first_seen_at` field on the wire. RN fabricates
 /// that timestamp client-side; native ports do NOT (per
@@ -87,8 +91,20 @@ struct DeviceRegisterResponse: Decodable {
     let message: String
     let deviceId: String?
     let generatedCDID: String?
+    let deviceDoc: DeviceDoc?
 
     enum CodingKeys: String, CodingKey {
-        case success, message, deviceId, generatedCDID
+        case success, message, deviceId, generatedCDID, deviceDoc
+    }
+}
+
+/// Server-managed device document. Free-form on the wire; we bind only the one
+/// field the SDK needs — `deviceId` — which is the sole place an
+/// `update_device` response carries the id. Other fields are left undecoded.
+struct DeviceDoc: Decodable {
+    let deviceId: String?
+
+    enum CodingKeys: String, CodingKey {
+        case deviceId
     }
 }
