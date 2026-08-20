@@ -1556,8 +1556,15 @@ public final class Swan: @unchecked Sendable {
     /// - If `ackUrl` is missing (creds saved before delivery-click-ack
     ///   shipped), the call no-ops. The next warm-start init() will
     ///   backfill `ackUrl` for subsequent cold starts.
-    /// - Errors are swallowed — fire-and-forget. Returns `false` on
-    ///   any failure path (missing creds, network error, non-2xx).
+    /// - Errors are swallowed — never throws. Returns `false` on any
+    ///   failure path (missing creds, network error, non-2xx).
+    /// - **Durable (SWA-9468):** a `false` caused by a network error or
+    ///   non-2xx does NOT lose the ACK. It is write-ahead-persisted to a
+    ///   pending queue on the App-Group suite before the POST, so the
+    ///   host app's next successful `initialize(...)` replays it. Set
+    ///   ``SwanConfig/appGroup`` (and pass the same `appGroup` here) for
+    ///   this to work — without an App Group the NSE process writes to a
+    ///   suite the host app cannot read.
     @discardableResult
     public static func ackPushDeliveredColdStart(
         _ messageId: String,
@@ -1593,9 +1600,29 @@ public final class Swan: @unchecked Sendable {
     ///
     /// **Capability:** `delivery-click-ack` (Phase 1.16 port).
     public func flushPendingAcks() {
-        guard let service = lock.sync(execute: { internals?.ackService }) else { return }
-        Task.detached(priority: .utility) {
-            await service.flushPending()
+        makeForegroundAckFlushHook()()
+    }
+
+    /// The foreground / on-demand ACK-drain hook. Resolves the live
+    /// ``NotificationAckService`` at CALL time (it is constructed after
+    /// ``SessionTracker`` in ``makeInternalsIfNeeded``, so there is nothing to
+    /// capture at wiring time) and single-flight-drains both retry queues on a
+    /// detached task.
+    ///
+    /// Shared by the public ``flushPendingAcks()`` and the closure wired into
+    /// ``SessionTracker``'s `flushPendingAcks`. Extracted into one named hook so
+    /// the exact behaviour the tracker fires on foreground is unit-testable —
+    /// the test bootstrap builds no `SessionTracker` (`sessionTracker: nil`), so
+    /// without this seam the wiring closure was never exercised. Covered by
+    /// `SwanForegroundAckFlushTests`; `SessionTrackerTests` separately proves the
+    /// tracker invokes its callback on foreground.
+    func makeForegroundAckFlushHook() -> @Sendable () -> Void {
+        return { [weak self] in
+            guard let self = self else { return }
+            guard let service = self.lock.sync(
+                execute: { self.internals?.ackService }
+            ) else { return }
+            Task.detached(priority: .utility) { await service.flushPending() }
         }
     }
 
@@ -1921,7 +1948,14 @@ public final class Swan: @unchecked Sendable {
                 },
                 forceFlush: { [weak tracker] in
                     Task.detached(priority: .utility) { _ = await tracker?.flush() }
-                }
+                },
+                // delivery-click-ack (SWA-9468): foreground drains the ACK
+                // queues too. Resolved through `internals` at CALL time rather
+                // than captured here — `ackService` is constructed further down
+                // this same function, so there's nothing to capture yet. Mirrors
+                // the init-time drain at the top of `initialize`. Shared with the
+                // public `flushPendingAcks()` so the fired behaviour is testable.
+                flushPendingAcks: makeForegroundAckFlushHook()
             )
             tracker.setPausedProvider { [weak sessionTracker] in
                 sessionTracker?.isPaused() ?? false
@@ -1972,20 +2006,35 @@ public final class Swan: @unchecked Sendable {
                 telemetry: BridgedPushTelemetryEmitter(telemetry: telemetryEmitter)
             )
 
-            // delivery-click-ack: orchestrator + retry store. Uses the
-            // same UserDefaults suite as credentials so wipes via
-            // [CredentialsStore.clear] do NOT clear the pending queue
-            // (each KV is sub-keyed; only credential sub-keys are
-            // wiped). Mirrors Android's `ACK_PENDING_PREFS_NAME` —
-            // separate suite name keeps the queue scoped.
+            // delivery-click-ack: orchestrator + warm-start retry store.
+            // Deliberately its OWN UserDefaults suite (not the credentials
+            // suite) so a wipe via [CredentialsStore.clear] does NOT drop
+            // the pending queue. Mirrors Android's `ACK_PENDING_PREFS_NAME`
+            // — a separate suite name keeps the queue scoped.
             let ackPendingStore = PendingAckStore(
                 store: UserDefaultsKeyValueStore(suiteName: Self.ackPendingSuiteName)
+            )
+            // SWA-9468 — the durable cold-start / NSE queue. It MUST live on
+            // the App-Group suite, because the NSE runs in a separate process
+            // and can only reach the app through the App Group;
+            // `ackPendingSuiteName` above is app-private and invisible to it.
+            // The suite choice is named and pinned in `ackColdStartSuiteName`
+            // (== `credentialsSuite` here) so this wiring can't silently drift
+            // onto the app-private suite. `ColdStartAckSender`
+            // write-ahead-enqueues here before its POST, and `flushPending()`
+            // drains it on warm start — that is how a receipt survives "device
+            // offline when the push landed on a killed app".
+            let ackColdStartStore = PendingAckStore(
+                store: UserDefaultsKeyValueStore(
+                    suiteName: Self.ackColdStartSuiteName(forAppGroup: config.appGroup)
+                )
             )
             let ackService = NotificationAckService(
                 appId: appId,
                 credentialsStore: store,
                 transport: DirectAckTransport(webhookUrl: ackUrl),
-                pendingStore: ackPendingStore
+                pendingStore: ackPendingStore,
+                coldStartStore: ackColdStartStore
             )
 
             // delivery-click-ack — wire the router's clickAckHook so
@@ -2043,8 +2092,25 @@ public final class Swan: @unchecked Sendable {
 
     /// `push-fcm-ios` retry queue is persisted under its own UserDefaults
     /// suite so a credentials wipe doesn't clear pending ACKs. Mirrors
-    /// Android `ACK_PENDING_PREFS_NAME`.
-    private static let ackPendingSuiteName = "swanPendingAcks"
+    /// Android `ACK_PENDING_PREFS_NAME`. This is the WARM-start queue and is
+    /// deliberately app-private — the NSE cannot see it (see
+    /// ``ackColdStartSuiteName(forAppGroup:)``).
+    static let ackPendingSuiteName = "swanPendingAcks"
+
+    /// The UserDefaults suite backing the durable cold-start / NSE ACK queue,
+    /// and the single source of truth for that choice.
+    ///
+    /// It MUST be the App-Group suite — the same container credentials use —
+    /// because the Notification Service Extension write-ahead-enqueues here from
+    /// a SEPARATE process and can only reach the app through the App Group. The
+    /// app-private ``ackPendingSuiteName`` (the warm-start queue) is invisible
+    /// to the NSE; wiring the cold-start store there instead would silently
+    /// strand every NSE receipt with nothing thrown and no failing test.
+    /// `makeInternalsIfNeeded` builds the `coldStartStore` from this, and
+    /// `SwanColdStartSuiteTests` pins it.
+    static func ackColdStartSuiteName(forAppGroup appGroup: String?) -> String {
+        CredentialsStore.suiteName(forAppGroup: appGroup)
+    }
 
     private func makeInternalsForTests(
         appId: String,
@@ -2169,6 +2235,10 @@ public final class Swan: @unchecked Sendable {
                 credentialsStore: store
             )
             let ackPendingStore = PendingAckStore(store: InMemoryKeyValueStore())
+            // Mirrors production's App-Group cold-start queue (SWA-9468) but
+            // in-memory, so the test seam exercises the same two-queue
+            // flushPending without touching a real UserDefaults suite.
+            let ackColdStartStore = PendingAckStore(store: InMemoryKeyValueStore())
             let ackService = NotificationAckService(
                 appId: appId,
                 credentialsStore: store,
@@ -2176,7 +2246,8 @@ public final class Swan: @unchecked Sendable {
                     webhookUrl: "https://webhook-dev.swan.cx/api/mobile-push-tracking",
                     underlying: client
                 ),
-                pendingStore: ackPendingStore
+                pendingStore: ackPendingStore,
+                coldStartStore: ackColdStartStore
             )
             // delivery-click-ack — same wiring as production. See Bug 18
             // note in `makeInternalsIfNeeded` for rationale.

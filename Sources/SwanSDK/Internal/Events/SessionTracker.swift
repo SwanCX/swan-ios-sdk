@@ -74,6 +74,19 @@ internal final class SessionTracker: @unchecked Sendable {
     private let emitAppLaunched: @Sendable (String) -> Void
     private let forceFlush: @Sendable () -> Void
 
+    /// Drains the delivery/click-ACK retry queues (SWA-9468). Separate from
+    /// ``forceFlush`` because ACKs ride their own transport and their own
+    /// durable store, not the event queue. Defaults to a no-op so callers
+    /// that don't care (most tests) needn't wire it.
+    ///
+    /// - Important: This closure is invoked from lifecycle callbacks that run
+    ///   on the main thread (`didBecomeActive`, size-threshold flush). It MUST
+    ///   return promptly — the implementation is expected to hand the actual
+    ///   drain to a detached `Task` and return, NOT to block on the network
+    ///   POSTs inline. Blocking here stalls the main queue on foreground.
+    ///   Mirrors Android's `onForegroundHook` promptness contract.
+    private let flushPendingAcks: @Sendable () -> Void
+
     /// `true` while the app is backgrounded. The ``EventTracker`` periodic-
     /// flush task consults this to skip ticks; the size-threshold flush
     /// path is NOT gated.
@@ -90,11 +103,13 @@ internal final class SessionTracker: @unchecked Sendable {
     init(
         sessionManager: SessionManager,
         emitAppLaunched: @escaping @Sendable (String) -> Void,
-        forceFlush: @escaping @Sendable () -> Void
+        forceFlush: @escaping @Sendable () -> Void,
+        flushPendingAcks: @escaping @Sendable () -> Void = {}
     ) {
         self.sessionManager = sessionManager
         self.emitAppLaunched = emitAppLaunched
         self.forceFlush = forceFlush
+        self.flushPendingAcks = flushPendingAcks
     }
 
     deinit {
@@ -123,6 +138,15 @@ internal final class SessionTracker: @unchecked Sendable {
         setPaused(false)
         _ = sessionManager.getId()
         emitAppLaunched(EventNames.appLaunched)
+        // delivery-click-ack (SWA-9468): drain the ACK retry queues on
+        // foreground, not just at init. Without this, an ACK that fails while
+        // the app keeps running waits until the NEXT launch — and on iOS the
+        // cold-start/NSE queue is written by a different process entirely, so
+        // foreground is the first moment the host can see those entries.
+        // RN parity: src/index.tsx:1306 drains on AppState 'active'.
+        // `flushPending()` is single-flighted, so overlapping with the
+        // init-time drain is safe.
+        flushPendingAcks()
     }
 
     /// Called when the app moves to the background.

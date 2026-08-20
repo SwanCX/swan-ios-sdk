@@ -26,8 +26,13 @@ import Foundation
 ///    background notification). Reads creds straight from UserDefaults and
 ///    POSTs without the SDK bootstrap. Mirrors RN's
 ///    `sendDirectNotificationAck` (src/index.tsx:5109) and the iOS NSE
-///    path (NotificationService.swift:97). NOT owned by this class —
-///    documented here for the contract.
+///    path (NotificationService.swift:97). The send itself is NOT owned by
+///    this class, but its durable queue is: SWA-9468 made that path
+///    write-ahead-persist to an **App-Group-backed** ``PendingAckStore``
+///    (the NSE is a separate process, so it cannot reach the app-private
+///    warm-start suite). ``flushPending()`` drains that ``coldStartStore``
+///    alongside its own queue — that is how ACKs persisted by the NSE
+///    while offline reach the backend.
 ///
 /// # RN parity
 ///
@@ -53,6 +58,11 @@ final class NotificationAckService {
     private let credentialsStore: CredentialsStore
     private let transport: DirectAckTransport
     private let pendingStore: PendingAckStore
+    /// App-Group-backed queue written by ``ColdStartAckSender`` (possibly
+    /// from the NSE process). Drained by ``flushPending()`` after the
+    /// warm-start queue. `nil` when the SDK was built without one
+    /// (tests / hosts on the legacy path).
+    private let coldStartStore: PendingAckStore?
     private let idGenerator: () -> String
     private let clock: () -> Int64
 
@@ -66,6 +76,7 @@ final class NotificationAckService {
         credentialsStore: CredentialsStore,
         transport: DirectAckTransport,
         pendingStore: PendingAckStore,
+        coldStartStore: PendingAckStore? = nil,
         idGenerator: @escaping () -> String = { UUID().uuidString },
         clock: @escaping () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1000) }
     ) {
@@ -73,6 +84,7 @@ final class NotificationAckService {
         self.credentialsStore = credentialsStore
         self.transport = transport
         self.pendingStore = pendingStore
+        self.coldStartStore = coldStartStore
         self.idGenerator = idGenerator
         self.clock = clock
     }
@@ -98,8 +110,16 @@ final class NotificationAckService {
         return sendInternal(messageId: messageId, event: .clicked, type: type, linkId: linkId)
     }
 
-    /// Drain the retry queue. Each entry POSTed independently; failures
+    /// Drain both retry queues. Each entry POSTed independently; failures
     /// stay queued. Single-flight via ``flushMutex``.
+    ///
+    /// Two queues are drained, in order:
+    ///   1. ``pendingStore`` — warm-start POSTs that failed in this process.
+    ///   2. ``coldStartStore`` — write-ahead rows persisted by
+    ///      ``ColdStartAckSender`` on the App-Group suite, possibly from the
+    ///      NSE process while the app was killed and the device offline
+    ///      (SWA-9468). Draining it here is the only way those receipts
+    ///      ever reach the backend.
     ///
     /// Called by ``Swan/initialize(appId:baseUrl:config:)`` on
     /// credentials-available. Idempotent.
@@ -109,39 +129,55 @@ final class NotificationAckService {
                 SwanLogger.debug("flushPending: no credentials yet; deferring.")
                 return
             }
-            let pending = pendingStore.snapshot()
-            if pending.isEmpty { return }
-            SwanLogger.debug("flushPending: draining \(pending.count) queued ACK(s).")
-            var sent: [String] = []
-            sent.reserveCapacity(pending.count)
-            for entry in pending {
-                let payload = AckPayload(
-                    commId: entry.commId,
-                    appId: appId,
-                    CDID: creds.currentCDID ?? creds.generatedCDID,
-                    event: entry.event,
-                    deviceId: creds.deviceId,
-                    type: entry.type,
-                    linkId: entry.linkId
-                )
-                let ok = await transport.post(payload)
-                if ok { sent.append(entry.id) }
-                // No early-exit: transient 5xx on one row shouldn't
-                // block the rest. FIFO order preserved by the persisted
-                // queue.
+            await drain(pendingStore, creds: creds, label: "warm-start")
+            if let coldStartStore = coldStartStore {
+                await drain(coldStartStore, creds: creds, label: "cold-start")
             }
-            if !sent.isEmpty { pendingStore.remove(ids: sent) }
         }
     }
 
-    /// Number of ACKs currently waiting in the retry queue.
-    func pendingCount() -> Int {
-        return pendingStore.snapshot().count
+    /// POST every row in `store`, removing the ones the backend accepted.
+    /// Callers must hold ``flushMutex``.
+    private func drain(
+        _ store: PendingAckStore,
+        creds: SwanCredentials,
+        label: String
+    ) async {
+        let pending = store.snapshot()
+        if pending.isEmpty { return }
+        SwanLogger.debug("flushPending: draining \(pending.count) queued \(label) ACK(s).")
+        var sent: [String] = []
+        sent.reserveCapacity(pending.count)
+        for entry in pending {
+            let payload = AckPayload(
+                commId: entry.commId,
+                appId: appId,
+                CDID: creds.currentCDID ?? creds.generatedCDID,
+                event: entry.event,
+                deviceId: creds.deviceId,
+                type: entry.type,
+                linkId: entry.linkId
+            )
+            let ok = await transport.post(payload)
+            if ok { sent.append(entry.id) }
+            // No early-exit: transient 5xx on one row shouldn't
+            // block the rest. FIFO order preserved by the persisted
+            // queue.
+        }
+        if !sent.isEmpty { store.remove(ids: sent) }
     }
 
-    /// Wipes the retry queue. Test seam + `Swan.resetForTests()` hook.
+    /// Number of ACKs currently waiting across both retry queues.
+    func pendingCount() -> Int {
+        return pendingStore.snapshot().count + (coldStartStore?.snapshot().count ?? 0)
+    }
+
+    /// Wipes both retry queues. Test seam + `Swan.resetForTests()` hook.
+    /// The cold-start queue is included: it lives on the real App-Group
+    /// suite, so leaving it behind would bleed rows across tests.
     func clear() {
         pendingStore.clear()
+        coldStartStore?.clear()
     }
 
     /// Synchronous variant of [sendInternal] used by tests + the

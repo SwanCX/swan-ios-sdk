@@ -8,6 +8,20 @@ import Foundation
 protocol KeyValueStore: AnyObject {
     func getString(_ key: String) -> String?
     func putString(_ key: String, _ value: String?)
+    /// Every key currently set whose name starts with `prefix`, in
+    /// unspecified order. Returned keys are LOGICAL names — pass them
+    /// straight back to ``getString(_:)`` / ``putString(_:_:)``; any
+    /// internal namespacing is added and stripped by the implementation.
+    ///
+    /// Exists so a collection can be persisted as one key PER ELEMENT
+    /// instead of a single serialized blob, and still be enumerated.
+    /// That matters for anything shared across processes (SWA-9468): a
+    /// blob — or a separate "index" key listing the element ids — has to
+    /// be read-modify-written, and two processes doing that concurrently
+    /// silently lose one another's writes. Independent per-element keys
+    /// have no such race, because no write ever rewrites another
+    /// element's key. See ``PendingAckStore``.
+    func keys(withPrefix prefix: String) -> [String]
     func clear()
     /// Force any pending writes to durable storage synchronously.
     ///
@@ -80,6 +94,16 @@ final class UserDefaultsKeyValueStore: KeyValueStore {
         }
     }
 
+    func keys(withPrefix prefix: String) -> [String] {
+        // `dictionaryRepresentation()` includes the registration domain and
+        // NSGlobalDomain on top of the suite's own keys, so the prefix filter
+        // is doing real work here, not just scoping.
+        let fullPrefix = keyPrefix + prefix
+        return defaults.dictionaryRepresentation().keys
+            .filter { $0.hasPrefix(fullPrefix) }
+            .map { String($0.dropFirst(keyPrefix.count)) }
+    }
+
     func clear() {
         // We only know which keys belong to us if they share the
         // prefix. In suite mode (production), `dictionaryRepresentation`
@@ -94,6 +118,19 @@ final class UserDefaultsKeyValueStore: KeyValueStore {
             : UserDefaultsKeyValueStore.knownSwanKeys.map { keyPrefix + $0 }
         for key in swanOwnedKeys {
             defaults.removeObject(forKey: key)
+        }
+        // Namespaces we own where the key names are dynamic, so an exact-name
+        // allowlist can't reach them. Without this, SWA-9468's per-ACK keys
+        // (`pendingAck.<uuid>`) would survive a credentials wipe on the App
+        // Group suite, silently changing the documented logout behaviour —
+        // queued cold-start ACKs are meant to drop on logout, because they can
+        // only be flushed against the CDID that was current when the push
+        // arrived.
+        for namespace in UserDefaultsKeyValueStore.knownSwanKeyPrefixes {
+            let fullPrefix = keyPrefix + namespace
+            for (key, _) in defaults.dictionaryRepresentation() where key.hasPrefix(fullPrefix) {
+                defaults.removeObject(forKey: key)
+            }
         }
         // Prefix mode still catches dynamically-named keys (e.g. queued
         // events keyed by uuid) that we own by construction.
@@ -140,8 +177,18 @@ final class UserDefaultsKeyValueStore: KeyValueStore {
         "swan_badge_count",
         // Carousel CE → host click data (consumePendingCarouselClick)
         "swanTemplateClickData",
-        // PendingAckStore — see PendingAckStore.Keys
+        // PendingAckStore — the PRE-SWA-9468 single-blob key. Retained so a
+        // wipe on a device that upgraded mid-queue still clears the legacy
+        // blob; live entries now live under the `pendingAck.` namespace below.
         "pendingAcks",
+    ]
+
+    /// Swan-owned key NAMESPACES, for stores whose key names are dynamic and
+    /// therefore can't appear in ``knownSwanKeys``. Matched by prefix.
+    /// MUST stay in sync with the emitting store's key builder.
+    internal static let knownSwanKeyPrefixes: [String] = [
+        // PendingAckStore — one key per queued ACK, see PendingAckStore.Keys.
+        "pendingAck.",
     ]
 }
 
@@ -164,6 +211,11 @@ final class InMemoryKeyValueStore: KeyValueStore {
         } else {
             map.removeValue(forKey: key)
         }
+    }
+
+    func keys(withPrefix prefix: String) -> [String] {
+        lock.lock(); defer { lock.unlock() }
+        return map.keys.filter { $0.hasPrefix(prefix) }
     }
 
     func clear() {
