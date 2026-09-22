@@ -29,14 +29,13 @@ import FoundationNetworking
 ///   RN throws "Credential not found! Please wait for Swan to register the
 ///   device!" (src/index.tsx:2014). Enrichments are NOT buffered like
 ///   `track()` — they share the identify/logout rejection posture.
-/// - **CDID resolved at FLUSH time, not enqueue time.** `flush()` reads
-///   `currentCDID ?? generatedCDID` from the store when it builds each body
-///   (RN's enrichPromises block reads the same, src/index.tsx:1800-1804), so
-///   the wire CDID reflects whatever identity is in effect at the moment the
-///   queue drains — not the one captured at `enrichProfile()` call time. When
-///   the SDK is already logged in, that's the logged-in `currentCDID`; when
-///   anonymous, the `generatedCDID`. This is what the conformance scenarios
-///   "CDID on flushed enrich body uses currentCDID when logged in" /
+/// - **CDID snapshotted at ENQUEUE time (MOO-704).** The CDID that was current
+///   when `enrichProfile()` was called is captured onto the queued
+///   `PendingEnrichment` and used at flush, so a login/logout rotation or a
+///   retry between enqueue and flush cannot re-stamp the enrichment onto a
+///   different profile. When called while logged in that's the `currentCDID`;
+///   while anonymous, the `generatedCDID` — which is what the conformance
+///   scenarios "CDID on flushed enrich body uses currentCDID when logged in" /
 ///   "falls back to generatedCDID when anonymous" assert.
 ///   NOTE: this service does not, on its own, decide pre- vs post-login
 ///   for an enrichment queued just before a `login()`/`identify()`. Those
@@ -104,13 +103,18 @@ internal final class EnrichProfileService: @unchecked Sendable {
         // not found" here (src/index.tsx:2014). The CDID itself is
         // resolved later at flush time so a login between enqueue and
         // flush is picked up.
-        guard credentialsStore.read() != nil else {
+        // Snapshot the CDID at call time (MOO-704) so a login/logout rotation
+        // or a retry before this enrichment flushes can't re-stamp it onto a
+        // different profile. Parity with RN / web / Android.
+        guard let creds = credentialsStore.read() else {
             return .failure(EnrichProfileError.credentialsNotFound)
         }
 
         let pending = PendingEnrichment(
             id: idGenerator(),
-            profileData: profileData
+            profileData: profileData,
+            currentCDID: creds.currentCDID,
+            generatedCDID: creds.generatedCDID
         )
         let size: Int = lockSync {
             queue.append(pending)
@@ -159,11 +163,16 @@ internal final class EnrichProfileService: @unchecked Sendable {
                 return
             }
 
-            let cdid = creds.currentCDID ?? creds.generatedCDID
-
             // Track failures so we can re-queue them at the front in order.
             var failed: [PendingEnrichment] = []
             for event in drained {
+                // MOO-704: use the CDID snapshotted at enqueue time; fall back
+                // to live creds only for events queued before this change.
+                let cdid =
+                    event.currentCDID
+                    ?? event.generatedCDID
+                    ?? creds.currentCDID
+                    ?? creds.generatedCDID
                 let ok = await postOne(event: event, cdid: cdid)
                 if !ok { failed.append(event) }
             }
@@ -230,13 +239,15 @@ internal final class EnrichProfileService: @unchecked Sendable {
     ///   - `id` — uuid for logging + future per-event status tracking.
     ///   - `profileData` — caller's blob, frozen as immutable dict.
     ///
-    /// Notably NOT captured: the CDID. It is read from the store at flush
-    /// time (src/index.tsx:1800-1804), and the conformance scenario "CDID on
-    /// flushed enrich body uses currentCDID when logged in" requires that
-    /// behavior.
+    ///   - `currentCDID` / `generatedCDID` — the CDID SNAPSHOT captured at
+    ///     enqueue time (MOO-704). Used at flush instead of live credentials so
+    ///     a login/logout rotation or a retry between enqueue and flush can't
+    ///     re-stamp the enrichment onto a different profile.
     internal struct PendingEnrichment {
         let id: String
         let profileData: [String: JSONValue]
+        let currentCDID: String?
+        let generatedCDID: String?
     }
 
     // MARK: - Wire payload (visible for testing)
