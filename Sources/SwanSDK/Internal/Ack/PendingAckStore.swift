@@ -18,7 +18,7 @@ import Foundation
 /// `UserDefaults` via ``KeyValueStore``. Each entry is its own key,
 /// ``Keys/entryPrefix`` + the entry's `id`, holding a small JSON object.
 /// Each entry captures the bare `commId` + event + optional deeplink
-/// metadata. CDID, appId, deviceId are NOT persisted — resolved at flush
+/// metadata + the optional carousel `itemIndex`. CDID, appId, deviceId are NOT persisted — resolved at flush
 /// time from ``CredentialsStore``, mirroring RN's "CDID resolved at flush
 /// time" invariant (src/index.tsx:1822).
 ///
@@ -111,6 +111,10 @@ final class PendingAckStore {
         let type: String?
         let linkId: String?
         let enqueuedAtMs: Int64
+        /// 0-based `carouselItems` position of the tapped card on a carousel
+        /// `clicked` ACK, so a replay still names the card. Entries written
+        /// before this field existed decode as `nil` (no card).
+        var itemIndex: Int?
     }
 
     private let store: KeyValueStore
@@ -217,6 +221,7 @@ final class PendingAckStore {
         ]
         if let type = entry.type { dict["type"] = type }
         if let linkId = entry.linkId { dict["linkId"] = linkId }
+        if let itemIndex = entry.itemIndex { dict["itemIndex"] = NSNumber(value: itemIndex) }
         do {
             let data = try JSONSerialization.data(withJSONObject: dict, options: [])
             store.putString(Keys.entryKey(entry.id), String(data: data, encoding: .utf8))
@@ -248,7 +253,8 @@ final class PendingAckStore {
             id: id, commId: commId, event: event,
             type: dict["type"] as? String,
             linkId: dict["linkId"] as? String,
-            enqueuedAtMs: enqueuedAtMs
+            enqueuedAtMs: enqueuedAtMs,
+            itemIndex: CarouselItemIndex.normalize(dict["itemIndex"])
         )
     }
 

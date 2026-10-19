@@ -46,7 +46,9 @@ internal struct IdentifyResult: Equatable {
 ///   FULL pipeline (RN parity).
 /// - **Best-effort**: on any network/protocol failure or unsuccessful
 ///   response the SDK identity is UNCHANGED. Resolves with the current CDID
-///   + `profileSwitched=false`. RN parity (src/index.tsx:2637).
+///   + `profileSwitched=false`. RN parity (src/index.tsx:2637). "Unsuccessful"
+///   includes a failed or missing `results[0]` — the top-level `success` is
+///   `true` for any accepted batch.
 /// - **On success**: persists `identifier` always; persists `currentCDID`
 ///   only when the server reports `profileSwitched=true` with a non-empty
 ///   CDID (src/index.tsx:2650).
@@ -206,18 +208,26 @@ internal final class IdentifyService: @unchecked Sendable {
                 return .success(IdentifyResult(CDID: creds.currentCDID, profileSwitched: false))
             }
 
-            guard let response = response, response.success else {
-                if response != nil {
+            // /v2/trackEvent answers top-level `success:true` whenever the batch
+            // was accepted; the login's real outcome is `results[0].success`.
+            // A failed (or missing) per-event result is a failed login: identity
+            // UNCHANGED — persisting `identifier` here would leave the SDK
+            // "identified" with no currentCDID, so a later logout() no-ops.
+            guard let response = response,
+                  response.success,
+                  let firstResult = response.results?.first,
+                  firstResult.success else {
+                if let response = response {
+                    let reason = response.results?.first?.error ?? "(no per-event result)"
                     SwanLogger.warn(
-                        "Swan.identify: no successful response from server — SDK identity unchanged."
+                        "Swan.identify: no successful response from server — SDK identity unchanged: \(reason)"
                     )
                 }
                 return .success(IdentifyResult(CDID: creds.currentCDID, profileSwitched: false))
             }
 
-            let firstResult = response.results?.first
-            let resolvedCDID = firstResult?.CDID
-            let profileSwitched = firstResult?.profileSwitched == true
+            let resolvedCDID = firstResult.CDID
+            let profileSwitched = firstResult.profileSwitched == true
 
             // Persist BEFORE notifying the listener so any post-callback
             // swanIdentifier read sees the new state.

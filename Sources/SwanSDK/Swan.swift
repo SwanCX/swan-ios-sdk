@@ -142,10 +142,10 @@ public final class Swan: @unchecked Sendable {
 
     // MARK: - State
 
-    /// SDK version string emitted on the wire (`common.sdkVersion`)
-    /// when the events capability lands. Anonymous-identity does not
-    /// stamp this on the device-register call.
-    static let sdkVersion = "2.7.3"
+    /// SDK version string emitted on the wire (`common.sdkVersion`).
+    /// Single source: ``SwanSDKVersion/current``, kept equal to the
+    /// podspec version by `scripts/check-ios-sdk-version.sh`.
+    static let sdkVersion = SwanSDKVersion.current
 
     /// Serial queue that protects all mutable state (`internals`,
     /// `state`). Using a serial DispatchQueue rather than an actor so
@@ -2045,9 +2045,7 @@ public final class Swan: @unchecked Sendable {
             // `didReceive(response:)` got the listener emission but
             // no backend ACK. Caught 2026-05-18 — Bug 18 in the
             // post-audit fixes.
-            router.setClickAckHook { [weak ackService] messageId in
-                _ = ackService?.sendClicked(messageId)
-            }
+            router.setClickAckHook(Self.makeClickAckHook(ackService))
 
             // notification-channels: register the 5 predefined Swan
             // UNNotificationCategories on init. Mirrors Android Phase
@@ -2087,6 +2085,16 @@ public final class Swan: @unchecked Sendable {
             )
             self.internals = internals
             return BootstrapResult(installed: internals, alreadyInitialized: false)
+        }
+    }
+
+    /// The router's click-ACK hook: one `clicked` ACK per accepted tap,
+    /// carrying the tapped carousel card's `itemIndex` when there is one.
+    /// Shared by the production and test bootstraps so both send the same
+    /// receipt.
+    static func makeClickAckHook(_ ackService: NotificationAckService) -> NotificationRouter.ClickAckHook {
+        return { [weak ackService] messageId, itemIndex in
+            _ = ackService?.sendClicked(messageId, itemIndex: itemIndex)
         }
     }
 
@@ -2251,9 +2259,7 @@ public final class Swan: @unchecked Sendable {
             )
             // delivery-click-ack — same wiring as production. See Bug 18
             // note in `makeInternalsIfNeeded` for rationale.
-            router.setClickAckHook { [weak ackService] messageId in
-                _ = ackService?.sendClicked(messageId)
-            }
+            router.setClickAckHook(Self.makeClickAckHook(ackService))
             // notification-channels + badge-count: test variant uses
             // in-memory state so per-test runs stay isolated. The
             // category manager uses a no-op host (no UN side effect).
@@ -2540,23 +2546,49 @@ public final class Swan: @unchecked Sendable {
         let resolvedMessageId = messageId.flatMap { $0.isEmpty ? nil : $0 }
             ?? data["messageId"]
             ?? data["gcm.message_id"]
-        if let clickRoute = consumePendingCarouselClick(forMessageId: resolvedMessageId) {
+        // Match the click data against every id this notification goes by:
+        // the extension writes the PAYLOAD id (`messageId` →
+        // `gcm.message_id`), while a host may pass
+        // `response.notification.request.identifier` as `messageId`. The ACK
+        // keeps `resolvedMessageId` as its commId.
+        let clickIds = [messageId, data["messageId"], data["gcm.message_id"]]
+            .compactMap { $0 }
+            .filter { !$0.isEmpty }
+        let carouselClick = consumePendingCarouselClick(forMessageIds: clickIds)
+        if let clickRoute = carouselClick?.route {
             data["route"] = clickRoute
         }
-        handleNotificationTap(data, messageId: resolvedMessageId)
+        // The tapped card (if the extension recorded one) rides on the
+        // clicked ACK as `itemIndex`; a body tap leaves it nil.
+        routeNotificationTap(
+            data,
+            messageId: resolvedMessageId,
+            carouselItemIndex: carouselClick?.itemIndex
+        )
+    }
+
+    /// A carousel tap the host's Notification Content Extension recorded in
+    /// the App Group (`swanTemplateClickData`).
+    struct PendingCarouselClick: Equatable {
+        /// The tapped card's route; `nil` when the extension wrote none.
+        let route: String?
+        /// 0-based position of the tapped card in the push's
+        /// `carouselItems`; `nil` when the extension wrote none (or an
+        /// invalid value — see ``CarouselItemIndex``).
+        let itemIndex: Int?
     }
 
     /// Read + clear the carousel-tap click data the host-app's
     /// Notification Content Extension persisted into the configured
-    /// App Group. Returns the resolved per-item route, or `nil` when
-    /// there's no pending click data (or it's stale / belongs to a
+    /// App Group. Returns the tapped card's route and `itemIndex`, or `nil`
+    /// when there's no pending click data (or it's stale / belongs to a
     /// different messageId).
     ///
     /// Internal — called once per `handleNotificationUserInfo`. Read +
     /// write are atomic via `UserDefaults` snapshot, and the key is
     /// cleared on read so a single tap can't fire two listener
     /// emissions (RN parity — `_lastCarouselClickHandledAt` dedup).
-    private func consumePendingCarouselClick(forMessageId messageId: String?) -> String? {
+    private func consumePendingCarouselClick(forMessageIds messageIds: [String]) -> PendingCarouselClick? {
         let appGroup = lock.sync { internals?.appGroup }
         guard let appGroup = appGroup, !appGroup.isEmpty else { return nil }
         guard let defaults = UserDefaults(suiteName: appGroup) else { return nil }
@@ -2584,16 +2616,21 @@ public final class Swan: @unchecked Sendable {
         // If the messageId is set, gate on it. CRUCIAL: do NOT clear
         // the click data when the messageId doesn't match — the legit
         // tap for that messageId might arrive shortly after.
-        if let mid = messageId, !mid.isEmpty,
-           let clickMid = dict["messageId"] as? String,
-           !clickMid.isEmpty,
-           clickMid != mid {
+        let clickMid = (dict["messageId"] as? String) ?? ""
+        if !messageIds.isEmpty, !clickMid.isEmpty, !messageIds.contains(clickMid) {
             return nil   // leave data in place for its rightful tap
         }
-        // Match (or no messageId provided) — consume it.
+        // Match (or no messageId on one side) — consume it. The card's
+        // `itemIndex` goes on the receipt only on a real id match: click
+        // data without a messageId could belong to any notification, so it
+        // may still route (as before) but never names a card.
+        let idMatched = !clickMid.isEmpty && messageIds.contains(clickMid)
         let route = (dict["route"] as? String) ?? ""
         defaults.removeObject(forKey: "swanTemplateClickData")
-        return route.isEmpty ? nil : route
+        return PendingCarouselClick(
+            route: route.isEmpty ? nil : route,
+            itemIndex: idMatched ? CarouselItemIndex.normalize(dict["itemIndex"]) : nil
+        )
     }
 
     /// Process a notification tap from a pre-flattened `[String: String]`
@@ -2611,6 +2648,18 @@ public final class Swan: @unchecked Sendable {
     public func handleNotificationTap(
         _ data: [String: String],
         messageId: String? = nil
+    ) {
+        routeNotificationTap(data, messageId: messageId, carouselItemIndex: nil)
+    }
+
+    /// Shared tap path. `carouselItemIndex` is the tapped carousel card from
+    /// the Content Extension's click data — only
+    /// ``handleNotificationUserInfo(_:messageId:)`` reads that, so the
+    /// pre-flattened ``handleNotificationTap(_:messageId:)`` passes `nil`.
+    private func routeNotificationTap(
+        _ data: [String: String],
+        messageId: String?,
+        carouselItemIndex: Int?
     ) {
         guard let router = lock.sync(execute: { internals?.router }) else {
             SwanLogger.warn("Swan.handleNotificationTap(): called before initialize(); tap dropped.")
@@ -2633,7 +2682,7 @@ public final class Swan: @unchecked Sendable {
             SwanLogger.info("[SwanSDK] Foreground notification received: \(id)")
         }
         let payload = PushPayloadParser.buildPayload(data)
-        router.emitOpened(payload, messageId: resolvedId)
+        router.emitOpened(payload, messageId: resolvedId, carouselItemIndex: carouselItemIndex)
     }
 
     // MARK: - cold-start-routing (delivery-click-ack seam)
@@ -2647,7 +2696,7 @@ public final class Swan: @unchecked Sendable {
     /// the HTTP ACK transport once that port lands. Host apps do NOT
     /// call this directly; left `internal` so a future public surface
     /// can be designed once the ACK transport ships.
-    func setClickAckHook(_ hook: (@Sendable (String) -> Void)?) {
+    func setClickAckHook(_ hook: NotificationRouter.ClickAckHook?) {
         guard let router = lock.sync(execute: { internals?.router }) else {
             return
         }

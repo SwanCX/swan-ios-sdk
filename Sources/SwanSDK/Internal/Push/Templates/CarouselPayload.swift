@@ -14,6 +14,11 @@ internal struct CarouselItem: Equatable {
     let title: String
     let body: String
     let route: String
+    /// 0-based position of this card in the push's `carouselItems`, set by
+    /// ``CarouselPayloadParser/parseItems(_:)``. Survives the filmstrip
+    /// imageless-card filter, so it can differ from the card's index in
+    /// ``CarouselPayload/items``; a carousel click reports it as `itemIndex`.
+    var position: Int = 0
 }
 
 /// Filmstrip vs standard carousel variant.
@@ -181,13 +186,14 @@ internal enum CarouselPayloadParser {
             return []
         }
         guard let array = parsed as? [Any] else { return [] }
-        return array.compactMap { element -> CarouselItem? in
+        return array.enumerated().compactMap { position, element -> CarouselItem? in
             guard let obj = element as? [String: Any] else { return nil }
             return CarouselItem(
                 imageUrl: stringOrEmpty(obj["imageUrl"]),
                 title: stringOrEmpty(obj["title"]),
                 body: stringOrEmpty(obj["body"]),
-                route: stringOrEmpty(obj["route"])
+                route: stringOrEmpty(obj["route"]),
+                position: position
             )
         }
     }

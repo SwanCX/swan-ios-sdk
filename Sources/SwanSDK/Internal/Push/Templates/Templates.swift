@@ -211,7 +211,8 @@ public enum Templates {
                     imageURL: item.imageUrl,
                     title: item.title,
                     body: item.body,
-                    route: item.route
+                    route: item.route,
+                    position: item.position
                 )
             },
             mode: mode,
@@ -250,6 +251,12 @@ public enum Templates {
             public let title: String
             public let body: String
             public let route: String
+            /// 0-based position of this card in the push's `carouselItems`.
+            /// Cards without an image are dropped from `items` for the
+            /// filmstrip variant, so this can differ from the card's index
+            /// in `items`. Write it as `itemIndex` in the click data when the
+            /// user taps this card.
+            public let position: Int
         }
         public enum Mode: String, Sendable, Equatable { case manual, auto }
         public enum Variant: String, Sendable, Equatable { case standard, filmstrip }

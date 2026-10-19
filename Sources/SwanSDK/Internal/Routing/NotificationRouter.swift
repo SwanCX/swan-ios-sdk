@@ -78,7 +78,10 @@ internal final class NotificationRouter: @unchecked Sendable {
 
     typealias OpenedListener = @Sendable (NotificationOpenedPayload) -> Void
     typealias DeepLinkListener = @Sendable (DeepLinkOpenedPayload) -> Void
-    typealias ClickAckHook = @Sendable (String) -> Void
+    /// `(messageId, itemIndex)` — `itemIndex` is the 0-based
+    /// `carouselItems` position of the tapped carousel card, `nil` when the
+    /// tap chose no card (body tap, standard push).
+    typealias ClickAckHook = @Sendable (_ messageId: String, _ itemIndex: Int?) -> Void
 
     /// Wrapped listener with a stable UUID identity so the unregister
     /// closure can target an exact registration without relying on
@@ -186,7 +189,15 @@ internal final class NotificationRouter: @unchecked Sendable {
     /// emissions have run. The hook ordering matches RN's
     /// `emitNotificationOpened(...); sendNotificationAck(messageId,
     /// 'clicked')` sequence (src/index.tsx:3699-3704).
-    func emitOpened(_ payload: NotificationOpenedPayload, messageId: String? = nil) {
+    ///
+    /// `carouselItemIndex` is handed to the hook unchanged: the 0-based
+    /// `carouselItems` position of the tapped carousel card, or `nil` when
+    /// the tap chose no card. It does not affect the listener payloads.
+    func emitOpened(
+        _ payload: NotificationOpenedPayload,
+        messageId: String? = nil,
+        carouselItemIndex: Int? = nil
+    ) {
         // Dedup gate. Blank / nil id → emit unconditionally (RN parity).
         let id: String? = {
             guard let raw = messageId else { return nil }
@@ -240,7 +251,7 @@ internal final class NotificationRouter: @unchecked Sendable {
             // letting NSException-style fatal errors bubble — listeners
             // that genuinely crash will already have crashed the SDK
             // task; no recovery is meaningful.
-            hook(id)
+            hook(id, carouselItemIndex)
         }
     }
 

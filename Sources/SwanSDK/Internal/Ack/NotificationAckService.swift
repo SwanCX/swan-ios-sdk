@@ -12,7 +12,7 @@ import Foundation
 ///
 /// # Transports
 ///
-/// 1. **Direct warm-start** — ``sendDelivered(_:)`` / ``sendClicked(_:type:linkId:)``.
+/// 1. **Direct warm-start** — ``sendDelivered(_:)`` / ``sendClicked(_:type:linkId:itemIndex:)``.
 ///    SDK is initialized and creds are loaded; fire the POST asynchronously.
 ///    Mirrors RN's queue-flushed transport when the queue drains
 ///    immediately (src/index.tsx:1814).
@@ -50,7 +50,7 @@ import Foundation
 ///
 /// ``flushPending()`` is serialized via the ``flushMutex`` actor — a
 /// network-up event during a flush in progress can't double-drain.
-/// Per-call ``sendDelivered(_:)`` / ``sendClicked(_:type:linkId:)`` are
+/// Per-call ``sendDelivered(_:)`` / ``sendClicked(_:type:linkId:itemIndex:)`` are
 /// stateless and reentrant; multiple in-flight POSTs are fine.
 final class NotificationAckService {
 
@@ -96,7 +96,7 @@ final class NotificationAckService {
     ///   through to ``ColdStartAckSender``) or messageId is blank.
     @discardableResult
     func sendDelivered(_ messageId: String) -> Bool {
-        return sendInternal(messageId: messageId, event: .delivered, type: nil, linkId: nil)
+        return sendInternal(messageId: messageId, event: .delivered, type: nil, linkId: nil, itemIndex: nil)
     }
 
     /// Fire a "clicked" ACK for a push.
@@ -105,9 +105,18 @@ final class NotificationAckService {
     ///   - messageId: FCM/APNs messageId → wire `commId`.
     ///   - type: optional — set to `"deepLink"` for deep-link clicks.
     ///   - linkId: optional — the `swan_link_id` URL param.
+    ///   - itemIndex: optional — 0-based `carouselItems` position of the
+    ///     tapped carousel card. `nil` for body taps and standard pushes.
     @discardableResult
-    func sendClicked(_ messageId: String, type: String? = nil, linkId: String? = nil) -> Bool {
-        return sendInternal(messageId: messageId, event: .clicked, type: type, linkId: linkId)
+    func sendClicked(
+        _ messageId: String,
+        type: String? = nil,
+        linkId: String? = nil,
+        itemIndex: Int? = nil
+    ) -> Bool {
+        return sendInternal(
+            messageId: messageId, event: .clicked, type: type, linkId: linkId, itemIndex: itemIndex
+        )
     }
 
     /// Drain both retry queues. Each entry POSTed independently; failures
@@ -156,7 +165,8 @@ final class NotificationAckService {
                 event: entry.event,
                 deviceId: creds.deviceId,
                 type: entry.type,
-                linkId: entry.linkId
+                linkId: entry.linkId,
+                itemIndex: entry.itemIndex
             )
             let ok = await transport.post(payload)
             if ok { sent.append(entry.id) }
@@ -189,13 +199,15 @@ final class NotificationAckService {
         messageId: String,
         event: AckEvent,
         type: String? = nil,
-        linkId: String? = nil
+        linkId: String? = nil,
+        itemIndex: Int? = nil
     ) async -> Bool {
         return await sendBlocking(
             messageId: messageId,
             event: event,
             type: type,
-            linkId: linkId
+            linkId: linkId,
+            itemIndex: itemIndex
         )
     }
 
@@ -203,7 +215,8 @@ final class NotificationAckService {
         messageId: String,
         event: AckEvent,
         type: String?,
-        linkId: String?
+        linkId: String?,
+        itemIndex: Int?
     ) -> Bool {
         if messageId.isEmpty {
             SwanLogger.warn("NotificationAckService: blank messageId for \(event); dropping.")
@@ -221,7 +234,9 @@ final class NotificationAckService {
         // Fire-and-forget background task. Returns immediately; the POST
         // runs on the SDK's Task scope.
         Task.detached(priority: .utility) { [weak self] in
-            _ = await self?.sendBlocking(messageId: messageId, event: event, type: type, linkId: linkId)
+            _ = await self?.sendBlocking(
+                messageId: messageId, event: event, type: type, linkId: linkId, itemIndex: itemIndex
+            )
         }
         return true
     }
@@ -233,7 +248,8 @@ final class NotificationAckService {
         messageId: String,
         event: AckEvent,
         type: String?,
-        linkId: String?
+        linkId: String?,
+        itemIndex: Int?
     ) async -> Bool {
         guard let creds = credentialsStore.read() else {
             return false
@@ -245,7 +261,8 @@ final class NotificationAckService {
             event: event,
             deviceId: creds.deviceId,
             type: type,
-            linkId: linkId
+            linkId: linkId,
+            itemIndex: itemIndex
         )
         let ok = await transport.post(payload)
         if !ok {
@@ -256,7 +273,10 @@ final class NotificationAckService {
                     event: event,
                     type: type,
                     linkId: linkId,
-                    enqueuedAtMs: clock()
+                    enqueuedAtMs: clock(),
+                    // The payload's value: already normalized, and nil on
+                    // anything but a clicked ACK.
+                    itemIndex: payload.itemIndex
                 )
             )
         }

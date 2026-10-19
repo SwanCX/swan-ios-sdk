@@ -26,9 +26,11 @@ enum AckEvent: String, Equatable {
 /// `linkId` are silently ignored on the wire but emitted for RN parity.
 ///
 /// Field ordering on the wire is fixed to match the RN golden:
-///   `commId, appId, CDID, event, deviceId, type?, linkId?`
+///   `commId, appId, CDID, event, deviceId, type?, linkId?, itemIndex?`
 /// `type` and `linkId` are appended only when non-empty (RN:
 /// `if (type) payload.type = type` / `if (linkId) payload.linkId = linkId`).
+/// `itemIndex` is appended only on a `clicked` ACK from a carousel card
+/// (`spec/wire/notification-ack.yaml#AckPayload.itemIndex`).
 struct AckPayload: Equatable {
     let commId: String
     let appId: String
@@ -39,6 +41,11 @@ struct AckPayload: Equatable {
     let type: String?
     /// Set with [type] when the deep-link URL carried `swan_link_id`.
     let linkId: String?
+    /// 0-based position of the tapped card in the push's `carouselItems`.
+    /// Set ONLY on a `clicked` ACK from a carousel card; `nil` (key omitted
+    /// on the wire) for body taps, standard pushes and `delivered`. Absent
+    /// is "no card", never 0.
+    let itemIndex: Int?
 
     init(
         commId: String,
@@ -47,7 +54,8 @@ struct AckPayload: Equatable {
         event: AckEvent,
         deviceId: String,
         type: String? = nil,
-        linkId: String? = nil
+        linkId: String? = nil,
+        itemIndex: Int? = nil
     ) {
         self.commId = commId
         self.appId = appId
@@ -56,6 +64,8 @@ struct AckPayload: Equatable {
         self.deviceId = deviceId
         self.type = type
         self.linkId = linkId
+        // Only a clicked receipt can name a card.
+        self.itemIndex = event == .clicked ? itemIndex.flatMap { $0 >= 0 ? $0 : nil } : nil
     }
 
     /// Encode to a JSON object dictionary in canonical field order.
@@ -74,6 +84,7 @@ struct AckPayload: Equatable {
         obj["deviceId"] = deviceId
         if let type = type, !type.isEmpty { obj["type"] = type }
         if let linkId = linkId, !linkId.isEmpty { obj["linkId"] = linkId }
+        if let itemIndex = itemIndex { obj["itemIndex"] = itemIndex }
         return obj
     }
 
@@ -85,5 +96,32 @@ struct AckPayload: Equatable {
             withJSONObject: toJsonObject(),
             options: []
         )
+    }
+}
+
+/// The carousel card a click came from, as the 0-based position in the push's
+/// `carouselItems` (`spec/wire/notification-ack.yaml#AckPayload.itemIndex`).
+///
+/// The value arrives from the host's Notification Content Extension through
+/// the App Group (`swanTemplateClickData.itemIndex`), so it is untrusted
+/// JSON. Accepts a non-negative integer, or a string of digits (same rule as
+/// RN's `carouselItemIndex`). Anything else — negative, fractional, boolean,
+/// non-numeric — is "no card" (`nil`), so the receipt omits the key rather
+/// than naming the wrong card.
+enum CarouselItemIndex {
+    static func normalize(_ value: Any?) -> Int? {
+        if let digits = value as? String {
+            guard !digits.isEmpty, digits.allSatisfy({ $0 >= "0" && $0 <= "9" }) else { return nil }
+            return Int(digits)
+        }
+        // JSON numbers AND booleans both arrive as NSNumber, and an NSNumber
+        // holding 0 or 1 also casts to Bool — so `as? Bool` can't tell
+        // `false` from card 0. The boxed type can: booleans are "c"/"B".
+        guard let number = value as? NSNumber else { return nil }
+        let objCType = String(cString: number.objCType)
+        if objCType == "c" || objCType == "B" { return nil }
+        let double = number.doubleValue
+        guard double >= 0, double.rounded() == double, double <= Double(Int32.max) else { return nil }
+        return Int(double)
     }
 }
